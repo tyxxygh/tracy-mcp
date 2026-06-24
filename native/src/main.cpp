@@ -131,6 +131,26 @@ static std::string normalize_zone_name(const std::string& s) {
     return std::regex_replace(s, re, "$1N");
 }
 
+// Extract the trailing numeric id baked into a zone name as a real number, so it
+// can be used quantitatively (e.g. drawcalls vs time): "mesh_commands_total#526"
+// -> 526, "pps_from:511" -> 511. Uses the last "#<digits>" / ":<digits>" match.
+// Returns false if the name carries no such number.
+static bool parse_name_value(const std::string& s, int64_t& out) {
+    static const std::regex re("[#:]([0-9]+)");
+    int64_t v = -1;
+    for (auto it = std::sregex_iterator(s.begin(), s.end(), re), e = std::sregex_iterator(); it != e; ++it)
+        v = std::stoll((*it)[1].str());
+    if (v < 0) return false;
+    out = v;
+    return true;
+}
+
+// Add a "name_value" field to a row if the name encodes a trailing #N/:N number.
+static void add_name_value(json& j, const std::string& name) {
+    int64_t v;
+    if (parse_name_value(name, v)) j["name_value"] = v;
+}
+
 // Population standard deviation (sample, n-1), matching csvexport's formula.
 static double zone_std(double sumSq, int64_t total, size_t count) {
     if (count <= 1) return 0.0;
@@ -243,6 +263,7 @@ static json agg_to_json(const ZoneAgg& a, double total_all_ns) {
     } else {
         j["self_total_ms"] = nullptr;
     }
+    add_name_value(j, a.name);
     return j;
 }
 
@@ -918,13 +939,15 @@ static json h_compare_frames(const json& p) {
     for (auto& kv : acc) {
         auto& e = kv.second;
         const int64_t d = e.ta - e.tb;
-        rows.push_back({
+        json row{
             {"name", e.name}, {"src_file", e.file}, {"src_line", e.line}, {"zone_type", e.type},
             {"frame_a", {{"time_ms", ns_to_ms(e.ta)}, {"count", e.ca}}},
             {"frame_b", {{"time_ms", ns_to_ms(e.tb)}, {"count", e.cb}}},
             {"delta", {{"time_ms", ns_to_ms(d)},
                        {"percent_of_frame_delta", refDelta != 0 ? (double)d / refDelta * 100.0 : 0.0}}},
-        });
+        };
+        add_name_value(row, e.name);
+        rows.push_back(std::move(row));
     }
     std::sort(rows.begin(), rows.end(), [&](const json& x, const json& y) {
         if (sortBy == "time_a") return x["frame_a"]["time_ms"].get<double>() > y["frame_a"]["time_ms"].get<double>();
@@ -1387,7 +1410,7 @@ static json h_zone_jitter(const json& p) {
         const double sd = std::sqrt(var);
         const int64_t p50 = pct(d, 0.50), p95 = pct(d, 0.95), p99 = pct(d, 0.99);
         const int64_t spike = p99 - p50;  // headroom of the worst frames over typical
-        rows.push_back({
+        json row{
             {"name", kv.second.name}, {"src_file", kv.second.file}, {"src_line", kv.second.line},
             {"zone_type", kv.second.type}, {"count", n},
             {"mean_ms", ns_to_ms((int64_t)mean)}, {"std_ms", ns_to_ms((int64_t)sd)},
@@ -1397,7 +1420,9 @@ static json h_zone_jitter(const json& p) {
             {"spike_ms", ns_to_ms(spike)},
             {"_std", sd}, {"_spike", (double)spike}, {"_cv", mean > 0 ? sd / mean : 0.0},
             {"_max", (double)d.back()}, {"_range", (double)(d.back() - d.front())},
-        });
+        };
+        add_name_value(row, kv.second.name);
+        rows.push_back(std::move(row));
     }
     auto keyOf = [&](const json& r) -> double {
         if (sortBy == "spike") return r["_spike"].get<double>();

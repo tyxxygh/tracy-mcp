@@ -63,3 +63,8 @@ aggregates over the window (the no-trim path uses Worker's precomputed stats).
 
 All numeric times in results are milliseconds unless named `_seconds`.
 Limits/aggregation are applied in C++ so payloads stay small.
+
+**`name_value`**: when a zone name ends in a number (`mesh_commands_total#526`,
+`pps_from:511`), `zone_stats` / `zone_jitter` / `compare_frames` rows carry the
+parsed integer as `name_value`, so it can be correlated with time quantitatively
+(e.g. us per drawcall) without string parsing.

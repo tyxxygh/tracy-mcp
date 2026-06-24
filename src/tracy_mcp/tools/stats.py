@@ -24,6 +24,10 @@ def get_zone_stats(
     CPU zones also include self (exclusive) time — self_total_ms/self_mean_ms/
     self_percent — which distinguishes "slow itself" from "slow children".
     Sort by "self_time" to find true leaf hotspots.
+
+    If a zone name encodes a trailing number (drawcalls/id, e.g.
+    "mesh_commands_total#526"), it is surfaced as a numeric `name_value` field,
+    so you can correlate it with time (e.g. us per drawcall) directly.
     """
     return query("zone_stats", {
         "trace_file": trace_file,
