@@ -86,10 +86,12 @@ pip install -e ".[dev]"
 | 工具 | 说明 |
 |------|------|
 | `tool_get_trace_info` | trace 元数据（程序名、捕获时间、时长、zone/帧/线程数） |
-| `tool_get_zone_stats` | zone 聚合统计（按源位置，支持 cpu/gpu/all） |
+| `tool_get_zone_stats` | zone 聚合统计（含 self 独占时间，支持 cpu/gpu/all） |
 | `tool_get_zone_timeline` | 时间段内的 zone 事件（raw / by_interval） |
+| `tool_get_frame_stats` | 帧时间分布（p50/p95/p99）+ 最慢帧 + 超预算统计 |
+| `tool_get_zone_outliers` | 某 zone 最慢的若干次调用（定位尖刺到具体帧） |
 | `tool_compare_traces` | 两个 trace 的 zone 统计对比 + 回退检测 |
-| `tool_compare_timelines` | 原生调用树的逐层对比 |
+| `tool_compare_timelines` | 原生调用树的逐层对比（cpu/gpu） |
 | `tool_get_messages` | 应用消息/日志 |
 | `tool_get_plots` | plot 时序数据（支持降采样） |
 | `tool_get_frame_range` | 帧号 → 精确时间范围 |

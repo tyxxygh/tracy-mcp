@@ -42,6 +42,50 @@ class TestZoneStats:
 
 
 @pytest.mark.integration
+class TestZoneSelfTime:
+    def test_cpu_zones_have_self_time(self):
+        from tracy_mcp.tools.stats import get_zone_stats
+        r = get_zone_stats(_trace(), zone_type="cpu", top_n=5, sort_by="self_time")
+        assert r["zones"]
+        z = r["zones"][0]
+        assert z["self_total_ms"] is not None
+        assert 0.0 <= z["self_percent"] <= 100.0
+        assert z["self_total_ms"] <= z["total_ms"] + 1e-6  # self <= total
+        # sorted by self_total descending
+        selfs = [x["self_total_ms"] for x in r["zones"]]
+        assert selfs == sorted(selfs, reverse=True)
+
+
+@pytest.mark.integration
+class TestFrameStats:
+    def test_distribution_and_slowest(self):
+        from tracy_mcp.tools.frames import get_frame_stats
+        r = get_frame_stats(_trace(), top_slowest=5, budget_ms=16.67)
+        fm = r["frame_ms"]
+        assert fm["min"] <= fm["p50"] <= fm["p95"] <= fm["p99"] <= fm["max"]
+        assert r["fps_mean"] > 0
+        assert len(r["slowest"]) <= 5
+        # slowest sorted descending by duration
+        durs = [s["duration_ms"] for s in r["slowest"]]
+        assert durs == sorted(durs, reverse=True)
+        assert r["frames_over_budget"] >= 0
+
+
+@pytest.mark.integration
+class TestZoneOutliers:
+    def test_worst_instances(self):
+        from tracy_mcp.tools.stats import get_zone_stats, get_zone_outliers
+        # pick a real zone name from stats
+        top = get_zone_stats(_trace(), zone_type="cpu", top_n=1)["zones"][0]["name"]
+        r = get_zone_outliers(_trace(), filter_name=top, top_n=5)
+        assert r["outliers"]
+        durs = [o["duration_ms"] for o in r["outliers"]]
+        assert durs == sorted(durs, reverse=True)
+        o = r["outliers"][0]
+        assert {"duration_ms", "start_second", "frame", "thread"} <= set(o)
+
+
+@pytest.mark.integration
 class TestTimeline:
     def test_window_events_are_relative(self):
         from tracy_mcp.tools.timeline import get_zone_timeline

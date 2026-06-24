@@ -83,9 +83,24 @@ trace 概况。**排查任何 trace 的第一步。**
 ### tool_get_zone_stats
 按源位置聚合的 zone 统计（Worker 预计算，快）。**找热点。**
 
-- 参数：`trace_file`、`zone_type`(`cpu`/`gpu`/`all`，默认 all)、`filter_name`(子串，大小写不敏感)、`sort_by`(`total_time`/`mean_time`/`count`/`max_time`)、`top_n`(默认 50，上限 500)
+- 参数：`trace_file`、`zone_type`(`cpu`/`gpu`/`all`，默认 all)、`filter_name`(子串，大小写不敏感)、`sort_by`(`total_time`/`mean_time`/`count`/`max_time`/`self_time`)、`top_n`(默认 50，上限 500)
 - 返回：`zones[]`（`name/src_file/src_line/zone_type/total_ms/total_percent/count/mean_ms/min_ms/max_ms/std_ms`）+ `summary`(`total_time_ms`、`top_5_consume_percent`)
+- **self（独占）时间**：CPU zone 额外含 `self_total_ms/self_mean_ms/self_max_ms/self_percent`。`self_percent` 接近 100% 说明是叶子热点（时间花在自身）；偏低说明耗时在子调用。`sort_by:"self_time"` 直接找真热点。GPU zone 无 self（字段为 null）。
 - 示例：`{"trace_file":"x.tracy","zone_type":"gpu","filter_name":"Shadow","top_n":10}`
+
+### tool_get_frame_stats
+帧时间分布 + 最慢帧。**判断「有没有超帧预算、卡在哪几帧」的第一工具。**
+
+- 参数：`trace_file`、`top_slowest`(默认 10，上限 100)、`budget_ms`(可选，如 16.67=60fps)
+- 返回：`frame_count`、`fps_mean`、`frame_ms{mean,p50,p95,p99,min,max}`、`slowest[{frame,start_second,duration_ms}]`；传了 `budget_ms` 还有 `frames_over_budget`、`percent_over_budget`
+- 提示：看 `p50`（典型帧）vs `mean`（受启动/卡顿帧拉高）；`p99` 是卡顿尾部。**注意**：profiling 开始前的启动帧 `start_second` 可能为负（如加载帧）。
+
+### tool_get_zone_outliers
+某个 zone **最慢的若干次调用**。**把尖刺定位到具体帧。**
+
+- 参数：`trace_file`、`filter_name`(必填，部分匹配)、`zone_type`(`cpu`/`gpu`)、`top_n`(默认 10，上限 200)、`start_second`/`end_second`(可选窗口)
+- 返回：`outliers[{duration_ms, start_second, frame, thread, name, src_file, src_line}]`（按耗时降序）+ `matched_locations`、`total_instances`
+- 用途：均值正常但偶发卡顿时，先 `zone_stats` 看 `max_ms ≫ mean_ms`，再用本工具看「最慢那几次在第几帧、哪个线程」。
 
 ### tool_get_zone_timeline
 时间段内的逐个 zone 事件（对时间排序的 zone 做二分查找，不导出全量）。
@@ -135,12 +150,17 @@ trace 概况。**排查任何 trace 的第一步。**
 2. `tool_compare_timelines`，`zone_type:"gpu"`，窗口覆盖多帧（如 0~12s），`max_depth:6`。
 3. 看树里每个 pass 的 `a`/`b` 均值与 `delta_percent`，定位变慢的分支。
 
-**找某个 zone 的尖刺：**
-1. `tool_get_zone_stats` `filter_name`=该 zone，看 `max_ms` 远大于 `mean_ms` 即有尖刺。
-2. `tool_get_frame_range` 把可疑帧号转成时间，再 `tool_get_zone_timeline` 看那一段的事件。
+**有没有超帧预算、卡在哪几帧：**
+1. `tool_get_frame_stats`，`budget_ms`=你的预算（如 16.67）。看 `p99` / `frames_over_budget` / `slowest`。
+2. 对某个慢帧，`tool_get_frame_range`(该帧号) → 时间窗 → `tool_get_zone_timeline` 看那一帧花在哪。
 
-**单帧拆解：**
-`tool_get_frame_range`(第 N 帧) → 拿到 `[start_second,end_second]` → `tool_get_zone_timeline` 该窗口 `by_interval`，或后续版本的单 trace 调用树。
+**找某个 zone 的尖刺：**
+1. `tool_get_zone_stats` `filter_name`=该 zone，看 `max_ms` 远大于 `mean_ms`，或 `self_percent` 判断是自身还是子调用。
+2. `tool_get_zone_outliers` `filter_name`=该 zone → 直接拿到最慢几次的 `frame` / `thread` / `start_second`。
+3. 拿可疑帧号 `tool_get_frame_range` → `tool_get_zone_timeline` 看那一段细节。
+
+**找真正的叶子热点：**
+`tool_get_zone_stats` `sort_by:"self_time"` —— self 时间排序排除「只是子调用慢」的父节点。
 
 ---
 

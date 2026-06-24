@@ -17,8 +17,11 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <queue>
 #include <string>
 #include <sys/stat.h>
+#include <type_traits>
+#include <utility>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -157,7 +160,17 @@ struct ZoneAgg {
     int64_t total_ns = 0, min_ns = 0, max_ns = 0;
     size_t count = 0;
     double std_ns = 0;
+    // Self (exclusive) time — only CPU SourceLocationZones tracks it.
+    bool has_self = false;
+    int64_t self_total_ns = 0, self_min_ns = 0, self_max_ns = 0;
 };
+
+// The per-srcloc zone-data struct is private in Worker, so we can't name it.
+// Detect self-time support (CPU has selfTotal; GPU doesn't) via a trait.
+template <typename T, typename = void>
+struct has_self_time : std::false_type {};
+template <typename T>
+struct has_self_time<T, std::void_t<decltype(std::declval<T>().selfTotal)>> : std::true_type {};
 
 template <typename ZonesMap>
 static void collect_aggs(const Worker& w, const ZonesMap& zones, const char* type,
@@ -179,13 +192,19 @@ static void collect_aggs(const Worker& w, const ZonesMap& zones, const char* typ
         a.min_ns = d.min;
         a.max_ns = d.max;
         a.std_ns = zone_std(d.sumSq, d.total, d.zones.size());
+        if constexpr (has_self_time<std::decay_t<decltype(d)>>::value) {
+            a.has_self = true;
+            a.self_total_ns = d.selfTotal;
+            a.self_min_ns = d.selfMin;
+            a.self_max_ns = d.selfMax;
+        }
         out.push_back(std::move(a));
     }
 }
 
 static json agg_to_json(const ZoneAgg& a, double total_all_ns) {
     const double mean_ns = a.count ? (double)a.total_ns / (double)a.count : 0.0;
-    return json{
+    json j{
         {"name", a.name},
         {"src_file", a.file},
         {"src_line", a.line},
@@ -198,6 +217,17 @@ static json agg_to_json(const ZoneAgg& a, double total_all_ns) {
         {"max_ms", ns_to_ms(a.max_ns)},
         {"std_ms", a.std_ns / 1e6},
     };
+    // Exclusive (self) time — distinguishes "slow itself" from "slow children".
+    if (a.has_self) {
+        const double self_mean = a.count ? (double)a.self_total_ns / (double)a.count : 0.0;
+        j["self_total_ms"] = ns_to_ms(a.self_total_ns);
+        j["self_mean_ms"] = ns_to_ms((int64_t)self_mean);
+        j["self_max_ms"] = ns_to_ms(a.self_max_ns);
+        j["self_percent"] = a.total_ns > 0 ? (double)a.self_total_ns / (double)a.total_ns * 100.0 : 0.0;
+    } else {
+        j["self_total_ms"] = nullptr;
+    }
+    return j;
 }
 
 // --------------------------------------------------------------------------
@@ -255,6 +285,7 @@ static json h_zone_stats(const json& p) {
                    (double)y.total_ns / std::max<size_t>(1, y.count);
         if (sortBy == "count") return x.count > y.count;
         if (sortBy == "max_time") return x.max_ns > y.max_ns;
+        if (sortBy == "self_time") return x.self_total_ns > y.self_total_ns;
         return x.total_ns > y.total_ns;  // total_time
     };
     std::sort(aggs.begin(), aggs.end(), cmp);
@@ -776,6 +807,160 @@ static json h_compare_timelines(const json& p) {
     return json{{"tree", root}, {"total_nodes", nodeCount}, {"truncated", truncated}};
 }
 
+// ---- frame statistics + slowest-frame finder ------------------------------
+
+static int frame_index_at(Worker& w, const tracy::FrameData* fd, int64_t t) {
+    if (!fd) return -1;
+    auto r = w.GetFrameRange(*fd, t, t);
+    return r.first;
+}
+
+static json h_frame_stats(const json& p) {
+    const std::string path = param_str(p, "trace_file");
+    int64_t topSlow = param_int(p, "top_slowest", 10);
+    if (topSlow > 100) topSlow = 100;
+    const bool hasBudget = p.contains("budget_ms") && p["budget_ms"].is_number();
+    const double budgetMs = param_num(p, "budget_ms", 0);
+    Worker& w = get_worker(path);
+
+    const tracy::FrameData* fdp = w.GetFramesBase();
+    if (!fdp) throw BackendError{"bad_request", "trace has no frame data"};
+    const auto& fd = *fdp;
+    const int64_t first = w.GetFirstTime();
+    const size_t n = w.GetFrameCount(fd);
+
+    struct Fr { int64_t dur; size_t idx; int64_t begin; };
+    std::vector<Fr> frames;
+    std::vector<int64_t> times;
+    frames.reserve(n); times.reserve(n);
+    const int64_t budgetNs = (int64_t)(budgetMs * 1e6);
+    int64_t over = 0;
+    for (size_t i = 0; i < n; i++) {
+        const int64_t t = w.GetFrameTime(fd, i);
+        if (t <= 0) continue;  // skip incomplete frames
+        times.push_back(t);
+        frames.push_back({t, i, w.GetFrameBegin(fd, i)});
+        if (hasBudget && t > budgetNs) ++over;
+    }
+    if (times.empty()) throw BackendError{"bad_request", "no measurable frames"};
+
+    std::vector<int64_t> sorted = times;
+    std::sort(sorted.begin(), sorted.end());
+    int64_t sum = 0; for (auto t : times) sum += t;
+    const double meanMs = ns_to_ms(sum / (int64_t)times.size());
+    auto pct = [&](double q) {
+        const double pos = std::clamp(q / 100.0 * (sorted.size() - 1), 0.0, (double)(sorted.size() - 1));
+        return ns_to_ms(sorted[(size_t)pos]);
+    };
+
+    const size_t k = std::min((size_t)topSlow, frames.size());
+    std::partial_sort(frames.begin(), frames.begin() + k, frames.end(),
+                      [](const Fr& a, const Fr& b) { return a.dur > b.dur; });
+    json slowest = json::array();
+    for (size_t i = 0; i < k; i++) {
+        slowest.push_back({
+            {"frame", (int64_t)frames[i].idx},
+            {"start_second", ns_to_ms(frames[i].begin - first) / 1000.0},
+            {"duration_ms", ns_to_ms(frames[i].dur)},
+        });
+    }
+
+    json out{
+        {"frame_count", (int64_t)times.size()},
+        {"fps_mean", meanMs > 0 ? 1000.0 / meanMs : 0.0},
+        {"frame_ms", {{"mean", meanMs}, {"p50", pct(50)}, {"p95", pct(95)}, {"p99", pct(99)},
+                      {"min", ns_to_ms(sorted.front())}, {"max", ns_to_ms(sorted.back())}}},
+        {"slowest", slowest},
+    };
+    if (hasBudget) {
+        out["budget_ms"] = budgetMs;
+        out["frames_over_budget"] = over;
+        out["percent_over_budget"] = (double)over / (double)times.size() * 100.0;
+    }
+    return out;
+}
+
+// ---- worst instances of a zone (outliers) ---------------------------------
+
+static json h_zone_outliers(const json& p) {
+    const std::string path = param_str(p, "trace_file");
+    const std::string filter = param_str(p, "filter_name");
+    const std::string zoneType = param_str(p, "zone_type", "cpu");
+    int64_t topN = param_int(p, "top_n", 10);
+    if (topN > 200) topN = 200;
+    if (topN < 1) topN = 1;
+    if (filter.empty()) throw BackendError{"bad_request", "filter_name is required for zone_outliers"};
+    Worker& w = get_worker(path);
+
+    const int64_t first = w.GetFirstTime();
+    const bool hasWin = p.contains("start_second") && p.contains("end_second");
+    const int64_t t0 = first + (int64_t)(param_num(p, "start_second", 0) * 1e9);
+    const int64_t t1 = first + (int64_t)(param_num(p, "end_second", 0) * 1e9);
+
+    struct Inst { int64_t dur, start; int16_t srcloc; uint16_t thread; };
+    auto cmp = [](const Inst& a, const Inst& b) { return a.dur > b.dur; };  // min-heap on dur
+    std::priority_queue<Inst, std::vector<Inst>, decltype(cmp)> heap(cmp);
+    int matched = 0;
+    int64_t total = 0;
+
+    auto consider = [&](int64_t s, int64_t e, int16_t srcloc, uint16_t thread) {
+        if (hasWin && (s < t0 || s >= t1)) return;
+        ++total;
+        Inst inst{e - s, s, srcloc, thread};
+        if ((int64_t)heap.size() < topN) heap.push(inst);
+        else if (heap.top().dur < inst.dur) { heap.pop(); heap.push(inst); }
+    };
+
+    if (zoneType == "gpu") {
+        for (auto& it : w.GetGpuSourceLocationZones()) {
+            const char* nm = zone_name(w, it.first);
+            if (!nm || !icontains(nm, filter)) continue;
+            ++matched;
+            for (const auto& ztd : it.second.zones) {
+                auto* z = ztd.Zone();
+                const int64_t s = z->GpuStart();
+                if (s < 0) continue;
+                consider(s, w.GetZoneEnd(*z), it.first, ztd.Thread());
+            }
+        }
+    } else {
+        for (auto& it : w.GetSourceLocationZones()) {
+            const char* nm = zone_name(w, it.first);
+            if (!nm || !icontains(nm, filter)) continue;
+            ++matched;
+            for (const auto& ztd : it.second.zones) {
+                auto* z = ztd.Zone();
+                consider(z->Start(), w.GetZoneEnd(*z), it.first, ztd.Thread());
+            }
+        }
+    }
+
+    std::vector<Inst> v;
+    while (!heap.empty()) { v.push_back(heap.top()); heap.pop(); }
+    std::reverse(v.begin(), v.end());  // slowest first
+
+    const tracy::FrameData* fd = w.GetFramesBase();
+    json outliers = json::array();
+    for (auto& inst : v) {
+        auto& sl = w.GetSourceLocation(inst.srcloc);
+        outliers.push_back({
+            {"duration_ms", ns_to_ms(inst.dur)},
+            {"start_second", ns_to_ms(inst.start - first) / 1000.0},
+            {"frame", frame_index_at(w, fd, inst.start)},
+            {"thread", thread_name(w, inst.thread)},
+            {"name", zone_name(w, inst.srcloc)},
+            {"src_file", w.GetString(sl.file)},
+            {"src_line", (int)sl.line},
+        });
+    }
+    return json{
+        {"zone", filter},
+        {"matched_locations", matched},
+        {"total_instances", total},
+        {"outliers", outliers},
+    };
+}
+
 // --------------------------------------------------------------------------
 // Dispatch + serve loop
 // --------------------------------------------------------------------------
@@ -785,6 +970,8 @@ static json dispatch(const std::string& method, const json& params) {
     if (method == "zone_stats") return h_zone_stats(params);
     if (method == "zone_timeline") return h_zone_timeline(params);
     if (method == "frame_range") return h_frame_range(params);
+    if (method == "frame_stats") return h_frame_stats(params);
+    if (method == "zone_outliers") return h_zone_outliers(params);
     if (method == "messages") return h_messages(params);
     if (method == "plots") return h_plots(params);
     if (method == "compare_traces") return h_compare_traces(params);

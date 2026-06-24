@@ -6,11 +6,12 @@ from fastmcp import FastMCP
 
 from tracy_mcp.backend.query_client import query, _find_backend, QueryBackendError
 from tracy_mcp.tools.info import get_trace_info
-from tracy_mcp.tools.stats import get_zone_stats
+from tracy_mcp.tools.stats import get_zone_stats, get_zone_outliers
 from tracy_mcp.tools.timeline import get_zone_timeline
 from tracy_mcp.tools.compare import compare_traces, compare_timelines
 from tracy_mcp.tools.messages import get_messages
 from tracy_mcp.tools.plots import get_plots
+from tracy_mcp.tools.frames import get_frame_stats
 
 # Create FastMCP server
 mcp = FastMCP(
@@ -49,8 +50,11 @@ def tool_get_zone_stats(
         trace_file: .tracy 文件路径
         zone_type: 过滤 zone 类型 — "cpu"(CPU zone), "gpu"(GPU zone), "all"(全部)
         filter_name: 按 zone 名称过滤（支持部分匹配）
-        sort_by: 排序方式 — "total_time"(总耗时), "mean_time"(均值), "count"(调用次数), "max_time"(最大单次)
-        top_n: 返回前 N 条结果，默认 50，最大 200
+        sort_by: 排序方式 — "total_time"(总耗时), "mean_time"(均值), "count"(调用次数), "max_time"(最大单次), "self_time"(自身独占耗时)
+        top_n: 返回前 N 条结果，默认 50，最大 500
+
+    CPU zone 额外含 self（独占）耗时：self_total_ms / self_mean_ms / self_percent，
+    用于区分「自身慢」还是「子调用慢」。按 self_time 排序可找真正的叶子热点。
     """
     return get_zone_stats(
         trace_file,
@@ -58,6 +62,57 @@ def tool_get_zone_stats(
         filter_name=filter_name,
         sort_by=sort_by,  # type: ignore
         top_n=top_n,
+    )
+
+
+@mcp.tool
+def tool_get_frame_stats(
+    trace_file: str,
+    top_slowest: int = 10,
+    budget_ms: float | None = None,
+) -> dict:
+    """获取帧时间分布与最慢的几帧。
+
+    返回每帧耗时的 mean / p50 / p95 / p99 / min / max、平均 FPS，以及最慢的 N 帧
+    （含帧号、相对起点的时间）。传 budget_ms 还会统计超预算帧数与占比。
+    实时程序判断「有没有超帧预算、卡在哪几帧」的第一工具。
+
+    Args:
+        trace_file: .tracy 文件路径
+        top_slowest: 返回最慢的 N 帧，默认 10，最大 100
+        budget_ms: 帧预算（毫秒），如 16.67（60fps）；传了则统计超预算帧
+    """
+    return get_frame_stats(trace_file, top_slowest=top_slowest, budget_ms=budget_ms)
+
+
+@mcp.tool
+def tool_get_zone_outliers(
+    trace_file: str,
+    filter_name: str,
+    zone_type: str = "cpu",
+    top_n: int = 10,
+    start_second: float | None = None,
+    end_second: float | None = None,
+) -> dict:
+    """获取某个 zone 最慢的若干次调用（离群实例）。
+
+    返回耗时最长的 top_n 次实例，每条含 duration_ms、相对起点的 start_second、
+    所在帧号 frame、线程 thread。用于把尖刺定位到具体某一帧（均值正常但偶发卡顿的排查）。
+
+    Args:
+        trace_file: .tracy 文件路径
+        filter_name: zone 名称（部分匹配，大小写不敏感），必填
+        zone_type: "cpu" 或 "gpu"
+        top_n: 返回最慢的 N 次，默认 10，最大 200
+        start_second / end_second: 可选，限定时间段（相对 trace 起点的秒）
+    """
+    return get_zone_outliers(
+        trace_file,
+        filter_name=filter_name,
+        zone_type=zone_type,  # type: ignore
+        top_n=top_n,
+        start_second=start_second,
+        end_second=end_second,
     )
 
 
