@@ -72,7 +72,15 @@ pip install -e ".[dev]"
 
 后端可执行文件会被自动发现（`native/build/Release|Debug`、`native/build`、PATH），或用环境变量 `TRACY_MCP_QUERY_PATH` 指定。
 
-### 在 Claude Desktop 中配置
+### 3. 接入客户端
+
+**Claude Code（CLI）**：
+
+```bash
+claude mcp add tracy -s user tracy-mcp
+```
+
+**Claude Desktop**（`claude_desktop_config.json`）：
 
 ```json
 {
@@ -81,6 +89,8 @@ pip install -e ".[dev]"
   }
 }
 ```
+
+各客户端的作用域、环境变量、验证与排错见 [docs/USAGE.md](docs/USAGE.md#4-接入-mcp-客户端)。
 
 ## 工具列表
 

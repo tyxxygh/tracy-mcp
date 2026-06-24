@@ -47,7 +47,35 @@ pip install -e ".[dev]"
 
 ## 4. 接入 MCP 客户端
 
-**Claude Desktop**（`claude_desktop_config.json`）：
+入口命令是 `tracy-mcp`（`pip install` 后即在 PATH；也可用 `python -m tracy_mcp.server`）。
+后端 exe 在默认位置时会被自动发现，否则用 `TRACY_MCP_QUERY_PATH` 指定。
+
+### 4.1 Claude Code（CLI）
+
+用 `claude mcp add` 添加（**推荐**）：
+
+```bash
+# 当前用户的所有项目都可用
+claude mcp add tracy -s user tracy-mcp
+
+# 想把后端路径写死（更保险）：-- 之后是启动命令，-e 设环境变量
+claude mcp add tracy -s user \
+  -e TRACY_MCP_QUERY_PATH=D:/ajin/opensourceProjs/tracy_mcp/native/build/Release/tracy-mcp-query.exe \
+  -- tracy-mcp
+```
+
+作用域 `-s`：`user`（所有项目，推荐）/ `local`（默认，仅你 + 当前项目）/ `project`（写进项目 `.mcp.json`，团队共享）。
+
+验证：
+
+```bash
+claude mcp list          # 显示 ✓ Connected 即成功
+claude mcp get tracy     # 查看详情
+```
+
+会话内输入 `/mcp` 可看到 `tracy` 及其工具；移除用 `claude mcp remove tracy -s user`。
+
+也可手动写进 `.mcp.json`（项目级）或 `~/.claude.json`（user 级）：
 
 ```json
 {
@@ -60,7 +88,16 @@ pip install -e ".[dev]"
 }
 ```
 
-`env` 可省略（能自动发现时）。任何支持 stdio 传输的 MCP 客户端同理：命令为 `tracy-mcp`。
+### 4.2 Claude Desktop
+
+编辑 `claude_desktop_config.json`，加入同样的一段（结构与上面的 `.mcp.json` 相同），重启 Claude Desktop。`env` 可省略（能自动发现时）。
+
+> 任何支持 stdio 传输的 MCP 客户端都同理：命令 `tracy-mcp`，可选 env `TRACY_MCP_QUERY_PATH`。
+
+### 4.3 排错
+
+- 连不上：先单独跑 `tracy-mcp`（Ctrl-C 退出）。它启动时会往 stderr 打印找到的后端路径；找不到会提示构建 `native/` 或设 `TRACY_MCP_QUERY_PATH`。
+- `tracy-mcp` 不在 PATH：把启动命令换成 `python -m tracy_mcp.server`（`claude mcp add tracy -s user -- python -m tracy_mcp.server`）。
 
 ---
 
