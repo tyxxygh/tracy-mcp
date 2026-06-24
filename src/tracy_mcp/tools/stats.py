@@ -36,6 +36,40 @@ def get_zone_stats(
     })
 
 
+def get_zone_jitter(
+    trace_file: str,
+    zone_type: Literal["cpu", "gpu", "all"] = "all",
+    filter_name: str | None = None,
+    sort_by: Literal["std", "spike", "cv", "max", "range"] = "std",
+    top_n: int = 30,
+    skip_first_frames: int = 10,
+    skip_last_frames: int = 4,
+) -> dict:
+    """Find the jittery / spiky zones — the stutter sources an average hides.
+
+    Per source location, computes the spread of its per-instance time:
+    mean/std/cv, min/max, p50/p95/p99, and spike_ms (p99 - p50, the headroom
+    the worst frames have over the typical frame). A zone with high std/spike
+    and a meaningful mean is what makes frame time jump.
+
+    By default the first 10 / last 4 frames are excluded — warmup/cooldown
+    spikes would otherwise dominate the jitter. GPU timestamps are CPU-aligned,
+    so GPU zones use the same window.
+
+    sort_by: "std" (default, absolute jitter in ms), "spike" (p99-p50),
+    "cv" (std/mean, relative), "max", or "range" (max-min).
+    """
+    return query("zone_jitter", {
+        "trace_file": trace_file,
+        "zone_type": zone_type,
+        "filter_name": filter_name or "",
+        "sort_by": sort_by,
+        "top_n": top_n,
+        "skip_first_frames": skip_first_frames,
+        "skip_last_frames": skip_last_frames,
+    })
+
+
 def get_zone_outliers(
     trace_file: str,
     filter_name: str,

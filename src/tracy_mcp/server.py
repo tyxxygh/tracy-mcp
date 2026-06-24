@@ -6,7 +6,7 @@ from fastmcp import FastMCP
 
 from tracy_mcp.backend.query_client import query, _find_backend, QueryBackendError
 from tracy_mcp.tools.info import get_trace_info
-from tracy_mcp.tools.stats import get_zone_stats, get_zone_outliers
+from tracy_mcp.tools.stats import get_zone_stats, get_zone_jitter, get_zone_outliers
 from tracy_mcp.tools.timeline import get_zone_timeline
 from tracy_mcp.tools.compare import compare_frames, compare_traces, compare_timelines
 from tracy_mcp.tools.messages import get_messages
@@ -101,6 +101,44 @@ def tool_get_frame_stats(
     return get_frame_stats(
         trace_file, top_slowest=top_slowest, budget_ms=budget_ms,
         skip_first_frames=skip_first_frames, skip_last_frames=skip_last_frames,
+    )
+
+
+@mcp.tool
+def tool_get_zone_jitter(
+    trace_file: str,
+    zone_type: str = "all",
+    filter_name: str | None = None,
+    sort_by: str = "std",
+    top_n: int = 30,
+    skip_first_frames: int = 10,
+    skip_last_frames: int = 4,
+) -> dict:
+    """找出抖动 / 尖峰最大的 zone —— 均值掩盖掉的卡顿来源。
+
+    对每个 source location，统计其逐次耗时的离散度：mean/std/cv、min/max、
+    p50/p95/p99，以及 spike_ms（p99 − p50，最差帧相对典型帧的多出量）。
+    std/spike 大且 mean 有量级的 zone，就是让帧时间跳变的元凶。
+
+    **默认排除前 10 / 后 4 帧**——否则 warmup/cooldown 尖峰会主导抖动。
+    GPU 时间戳已 CPU 对齐，GPU zone 用同一窗口。
+
+    Args:
+        trace_file: .tracy 文件路径
+        zone_type: "cpu" | "gpu" | "all"
+        filter_name: 按 zone 名称过滤
+        sort_by: "std"(默认，绝对抖动 ms) | "spike"(p99−p50) | "cv"(std/mean，相对) | "max" | "range"(max−min)
+        top_n: 返回前 N 条，默认 30
+        skip_first_frames / skip_last_frames: 默认裁剪帧数（10 / 4）
+    """
+    return get_zone_jitter(
+        trace_file,
+        zone_type=zone_type,  # type: ignore
+        filter_name=filter_name,
+        sort_by=sort_by,  # type: ignore
+        top_n=top_n,
+        skip_first_frames=skip_first_frames,
+        skip_last_frames=skip_last_frames,
     )
 
 

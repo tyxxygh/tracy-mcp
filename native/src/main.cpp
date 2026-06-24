@@ -1310,6 +1310,118 @@ static json h_zone_outliers(const json& p) {
     return out;
 }
 
+// ---- zone_jitter: per-zone frame-to-frame variance / spikes ---------------
+// Surfaces stutter sources: zones whose per-instance time is unstable (high std
+// / spikes), which an averaged stat hides. GPU timestamps are CPU-aligned, so
+// the same trim window applies; warmup/cooldown is trimmed by default (those
+// spikes would otherwise dominate the jitter).
+
+struct JitterStat {
+    std::string name, file;
+    int line = 0;
+    const char* type = "cpu";
+    std::vector<int64_t> durs;
+};
+
+template <typename ZonesMap, typename StartFn>
+static void collect_jitter(Worker& w, const ZonesMap& zones, const char* type,
+                           const std::string& filter, int64_t t0, int64_t t1,
+                           StartFn startfn, std::map<int16_t, JitterStat>& acc) {
+    for (auto& it : zones) {
+        const char* nm = zone_name(w, it.first);
+        if (!nm) nm = "";
+        if (!filter.empty() && !icontains(nm, filter)) continue;
+        JitterStat* js = nullptr;
+        for (auto& ztd : it.second.zones) {
+            auto* z = ztd.Zone();
+            const int64_t s = startfn(*z);
+            if (s < 0) continue;
+            if (s < t0) continue;
+            if (s >= t1) break;  // zones sorted by start
+            if (!js) {
+                auto& sl = w.GetSourceLocation(it.first);
+                auto& ref = acc[it.first];
+                ref.name = nm; ref.file = w.GetString(sl.file); ref.line = (int)sl.line; ref.type = type;
+                js = &ref;
+            }
+            js->durs.push_back(w.GetZoneEnd(*z) - s);
+        }
+    }
+}
+
+static json h_zone_jitter(const json& p) {
+    const std::string path = param_str(p, "trace_file");
+    const std::string zoneType = param_str(p, "zone_type", "all");
+    const std::string filter = param_str(p, "filter_name");
+    const std::string sortBy = param_str(p, "sort_by", "std");
+    int64_t topN = param_int(p, "top_n", 30);
+    if (topN > 500) topN = 500;
+
+    Worker& w = get_worker(path);
+    const Trim trim = resolve_trim(w, p);
+    const int64_t t0 = trim.t0, t1 = trim.t1;
+
+    std::map<int16_t, JitterStat> acc;
+    if (zoneType == "cpu" || zoneType == "all")
+        collect_jitter(w, w.GetSourceLocationZones(), "cpu", filter, t0, t1,
+                       [](const tracy::ZoneEvent& z) { return z.Start(); }, acc);
+    if (zoneType == "gpu" || zoneType == "all")
+        collect_jitter(w, w.GetGpuSourceLocationZones(), "gpu", filter, t0, t1,
+                       [](const tracy::GpuEvent& z) { return z.GpuStart(); }, acc);
+
+    auto pct = [](const std::vector<int64_t>& v, double q) {
+        if (v.empty()) return (int64_t)0;
+        size_t i = (size_t)(q * (v.size() - 1) + 0.5);
+        return v[std::min(i, v.size() - 1)];
+    };
+    std::vector<json> rows;
+    for (auto& kv : acc) {
+        auto& d = kv.second.durs;
+        if (d.size() < 2) continue;  // need >=2 instances to talk about jitter
+        std::sort(d.begin(), d.end());
+        const size_t n = d.size();
+        double sum = 0, sumSq = 0;
+        for (int64_t x : d) { sum += (double)x; sumSq += (double)x * (double)x; }
+        const double mean = sum / n;
+        const double var = std::max(0.0, sumSq / n - mean * mean);
+        const double sd = std::sqrt(var);
+        const int64_t p50 = pct(d, 0.50), p95 = pct(d, 0.95), p99 = pct(d, 0.99);
+        const int64_t spike = p99 - p50;  // headroom of the worst frames over typical
+        rows.push_back({
+            {"name", kv.second.name}, {"src_file", kv.second.file}, {"src_line", kv.second.line},
+            {"zone_type", kv.second.type}, {"count", n},
+            {"mean_ms", ns_to_ms((int64_t)mean)}, {"std_ms", ns_to_ms((int64_t)sd)},
+            {"cv", mean > 0 ? sd / mean : 0.0},
+            {"min_ms", ns_to_ms(d.front())}, {"max_ms", ns_to_ms(d.back())},
+            {"p50_ms", ns_to_ms(p50)}, {"p95_ms", ns_to_ms(p95)}, {"p99_ms", ns_to_ms(p99)},
+            {"spike_ms", ns_to_ms(spike)},
+            {"_std", sd}, {"_spike", (double)spike}, {"_cv", mean > 0 ? sd / mean : 0.0},
+            {"_max", (double)d.back()}, {"_range", (double)(d.back() - d.front())},
+        });
+    }
+    auto keyOf = [&](const json& r) -> double {
+        if (sortBy == "spike") return r["_spike"].get<double>();
+        if (sortBy == "cv")    return r["_cv"].get<double>();
+        if (sortBy == "max")   return r["_max"].get<double>();
+        if (sortBy == "range") return r["_range"].get<double>();
+        return r["_std"].get<double>();  // default
+    };
+    std::sort(rows.begin(), rows.end(), [&](const json& x, const json& y) { return keyOf(x) > keyOf(y); });
+
+    json out = json::array();
+    for (int64_t i = 0; i < (int64_t)rows.size() && i < topN; ++i) {
+        json r = rows[i];
+        r.erase("_std"); r.erase("_spike"); r.erase("_cv"); r.erase("_max"); r.erase("_range");
+        out.push_back(std::move(r));
+    }
+    return json{
+        {"zones", out},
+        {"total_zones", (int64_t)rows.size()},
+        {"sort_by", sortBy},
+        {"trim", trim_json(w, trim)},
+    };
+}
+
 // --------------------------------------------------------------------------
 // Dispatch + serve loop
 // --------------------------------------------------------------------------
@@ -1325,6 +1437,7 @@ static json dispatch(const std::string& method, const json& params) {
     if (method == "plots") return h_plots(params);
     if (method == "compare_traces") return h_compare_traces(params);
     if (method == "compare_frames") return h_compare_frames(params);
+    if (method == "zone_jitter") return h_zone_jitter(params);
     if (method == "compare_timelines") return h_compare_timelines(params);
     throw BackendError{"unknown_method", "unknown method: " + method};
 }
