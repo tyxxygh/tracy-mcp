@@ -836,6 +836,115 @@ static json h_compare_traces(const json& p) {
     };
 }
 
+// ---- compare_frames: diff two frame indices within one trace --------------
+// Per source location, sum zone time inside each frame's [begin,end) CPU window.
+// Each zone instance is assigned to exactly one frame by its midpoint (so a GPU
+// "Frame" zone longer than the CPU window, or one straddling a boundary, lands in
+// a single frame, matching the profiler's Frame-compare behavior). GPU timestamps
+// are already CPU-aligned at load, so both share the CPU-time frame windows.
+
+struct FrameDiffEntry {
+    std::string name, file;
+    int line = 0;
+    const char* type = "cpu";
+    int64_t ta = 0, tb = 0;
+    size_t ca = 0, cb = 0;
+};
+
+template <typename ZonesMap, typename StartFn>
+static void collect_frame_diff(Worker& w, const ZonesMap& zones, const char* type,
+                               const std::string& filter,
+                               int64_t minA, int64_t maxA, int64_t minB, int64_t maxB,
+                               StartFn startfn, std::map<int16_t, FrameDiffEntry>& acc) {
+    for (auto& it : zones) {
+        const char* nm = zone_name(w, it.first);
+        if (!nm) nm = "";
+        if (!filter.empty() && !icontains(nm, filter)) continue;
+        for (auto& ztd : it.second.zones) {
+            auto* z = ztd.Zone();
+            const int64_t s = startfn(*z);
+            if (s < 0) continue;
+            const int64_t e = w.GetZoneEnd(*z);
+            const int64_t mid = s + (e - s) / 2;
+            int which;
+            if (mid >= minA && mid < maxA) which = 1;
+            else if (mid >= minB && mid < maxB) which = 2;
+            else continue;
+            auto iit = acc.find(it.first);
+            if (iit == acc.end()) {
+                auto& sl = w.GetSourceLocation(it.first);
+                FrameDiffEntry fe;
+                fe.name = nm; fe.file = w.GetString(sl.file); fe.line = (int)sl.line; fe.type = type;
+                iit = acc.emplace(it.first, std::move(fe)).first;
+            }
+            if (which == 1) { iit->second.ta += e - s; iit->second.ca++; }
+            else            { iit->second.tb += e - s; iit->second.cb++; }
+        }
+    }
+}
+
+static json h_compare_frames(const json& p) {
+    const std::string path = param_str(p, "trace_file");
+    const int64_t fa = param_int(p, "frame_a", -1);
+    const int64_t fb = param_int(p, "frame_b", -1);
+    const std::string zoneType = param_str(p, "zone_type", "gpu");
+    const std::string filter = param_str(p, "filter_name");
+    const std::string sortBy = param_str(p, "sort_by", "abs_delta");
+    int64_t topN = param_int(p, "top_n", 50);
+    if (topN > 500) topN = 500;
+
+    Worker& w = get_worker(path);
+    if (w.GetFrames().empty()) throw BackendError{"bad_request", "trace has no frame data"};
+    const auto& fd = *w.GetFramesBase();
+    const int64_t cnt = (int64_t)w.GetFrameCount(fd);
+    if (fa < 0 || fa >= cnt || fb < 0 || fb >= cnt)
+        throw BackendError{"bad_request", "frame_a/frame_b out of range [0," + std::to_string(cnt - 1) + "]"};
+
+    const int64_t minA = w.GetFrameBegin(fd, (size_t)fa), maxA = w.GetFrameEnd(fd, (size_t)fa);
+    const int64_t minB = w.GetFrameBegin(fd, (size_t)fb), maxB = w.GetFrameEnd(fd, (size_t)fb);
+    const int64_t ftA = maxA - minA, ftB = maxB - minB;
+    const int64_t frameDelta = ftA - ftB;
+    const int64_t refDelta = frameDelta != 0 ? std::abs(frameDelta) : std::max(ftA, ftB);
+
+    std::map<int16_t, FrameDiffEntry> acc;
+    if (zoneType == "cpu" || zoneType == "all")
+        collect_frame_diff(w, w.GetSourceLocationZones(), "cpu", filter, minA, maxA, minB, maxB,
+                           [](const tracy::ZoneEvent& z) { return z.Start(); }, acc);
+    if (zoneType == "gpu" || zoneType == "all")
+        collect_frame_diff(w, w.GetGpuSourceLocationZones(), "gpu", filter, minA, maxA, minB, maxB,
+                           [](const tracy::GpuEvent& z) { return z.GpuStart(); }, acc);
+
+    std::vector<json> rows;
+    for (auto& kv : acc) {
+        auto& e = kv.second;
+        const int64_t d = e.ta - e.tb;
+        rows.push_back({
+            {"name", e.name}, {"src_file", e.file}, {"src_line", e.line}, {"zone_type", e.type},
+            {"frame_a", {{"time_ms", ns_to_ms(e.ta)}, {"count", e.ca}}},
+            {"frame_b", {{"time_ms", ns_to_ms(e.tb)}, {"count", e.cb}}},
+            {"delta", {{"time_ms", ns_to_ms(d)},
+                       {"percent_of_frame_delta", refDelta != 0 ? (double)d / refDelta * 100.0 : 0.0}}},
+        });
+    }
+    std::sort(rows.begin(), rows.end(), [&](const json& x, const json& y) {
+        if (sortBy == "time_a") return x["frame_a"]["time_ms"].get<double>() > y["frame_a"]["time_ms"].get<double>();
+        if (sortBy == "time_b") return x["frame_b"]["time_ms"].get<double>() > y["frame_b"]["time_ms"].get<double>();
+        return std::abs(x["delta"]["time_ms"].get<double>()) > std::abs(y["delta"]["time_ms"].get<double>());
+    });
+    json out = json::array();
+    for (int64_t i = 0; i < (int64_t)rows.size() && i < topN; ++i) out.push_back(rows[i]);
+
+    return json{
+        {"comparisons", out},
+        {"total_zones_matched", (int64_t)rows.size()},
+        {"summary", {
+            {"frame_a", fa}, {"frame_b", fb},
+            {"frame_a_time_ms", ns_to_ms(ftA)}, {"frame_b_time_ms", ns_to_ms(ftB)},
+            {"frame_delta_ms", ns_to_ms(frameDelta)},
+        }},
+    };
+}
+
 // ---- compare_timelines: native call tree via GetZoneChildren --------------
 
 struct PathStat { int64_t total = 0, mn = INT64_MAX, mx = 0; std::vector<int64_t> durs; };
@@ -1215,6 +1324,7 @@ static json dispatch(const std::string& method, const json& params) {
     if (method == "messages") return h_messages(params);
     if (method == "plots") return h_plots(params);
     if (method == "compare_traces") return h_compare_traces(params);
+    if (method == "compare_frames") return h_compare_frames(params);
     if (method == "compare_timelines") return h_compare_timelines(params);
     throw BackendError{"unknown_method", "unknown method: " + method};
 }

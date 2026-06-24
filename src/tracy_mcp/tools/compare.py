@@ -44,6 +44,38 @@ def compare_traces(
     })
 
 
+def compare_frames(
+    trace_file: str,
+    frame_a: int,
+    frame_b: int,
+    zone_type: Literal["cpu", "gpu", "all"] = "gpu",
+    filter_name: str | None = None,
+    sort_by: Literal["abs_delta", "time_a", "time_b"] = "abs_delta",
+    top_n: int = 50,
+) -> dict:
+    """Diff two frames *within one trace*, zone by zone (like the profiler's Frame compare).
+
+    For each frame, sums per-source-location zone time inside that frame's
+    [begin, end) window. Each zone instance is assigned to exactly one frame by
+    its midpoint, so a GPU "Frame" zone longer than the CPU window (GPU-bound) or
+    one straddling a boundary is counted once — no double counting. GPU timestamps
+    are already CPU-aligned, so CPU and GPU share the same frame windows.
+
+    Rows carry frame_a/frame_b {time_ms,count}, the delta, and
+    percent_of_frame_delta (how much of the frame-time difference this zone
+    explains). Defaults to GPU zones. Sorted by |delta| descending.
+    """
+    return query("compare_frames", {
+        "trace_file": trace_file,
+        "frame_a": frame_a,
+        "frame_b": frame_b,
+        "zone_type": zone_type,
+        "filter_name": filter_name or "",
+        "sort_by": sort_by,
+        "top_n": top_n,
+    })
+
+
 def compare_timelines(
     trace_file_a: str,
     trace_file_b: str,

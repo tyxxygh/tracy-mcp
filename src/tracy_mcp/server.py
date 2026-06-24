@@ -8,7 +8,7 @@ from tracy_mcp.backend.query_client import query, _find_backend, QueryBackendErr
 from tracy_mcp.tools.info import get_trace_info
 from tracy_mcp.tools.stats import get_zone_stats, get_zone_outliers
 from tracy_mcp.tools.timeline import get_zone_timeline
-from tracy_mcp.tools.compare import compare_traces, compare_timelines
+from tracy_mcp.tools.compare import compare_frames, compare_traces, compare_timelines
 from tracy_mcp.tools.messages import get_messages
 from tracy_mcp.tools.plots import get_plots
 from tracy_mcp.tools.frames import get_frame_stats
@@ -272,6 +272,46 @@ def tool_compare_timelines(
         filter_name=filter_name,
         max_depth=max_depth,
         limit=limit,
+    )
+
+
+@mcp.tool
+def tool_compare_frames(
+    trace_file: str,
+    frame_a: int,
+    frame_b: int,
+    zone_type: str = "gpu",
+    filter_name: str | None = None,
+    sort_by: str = "abs_delta",
+    top_n: int = 50,
+) -> dict:
+    """在**同一个 trace 内**逐 zone 对比两帧（等价于 profiler 的 Frame compare）。
+
+    对每一帧，按 source location 汇总落在该帧 [begin, end) 窗口内的 zone 耗时。
+    每个 zone 实例按**中点**归属到唯一一帧，因此 GPU-bound 下比 CPU 帧窗口还长的
+    GPU "Frame" zone、或跨帧边界的 zone 都只计一次，不会重复计数。GPU 时间戳已
+    CPU 对齐，故 CPU/GPU 共用同一帧窗口。
+
+    每行含 frame_a/frame_b 的 {time_ms,count}、delta、以及 percent_of_frame_delta
+    （该 zone 解释了帧时间差的百分之多少）。默认只看 GPU zone，按 |delta| 降序。
+
+    Args:
+        trace_file: .tracy 文件路径
+        frame_a: 第一帧帧号（基准帧集）
+        frame_b: 第二帧帧号
+        zone_type: "cpu" | "gpu" | "all"（默认 gpu）
+        filter_name: 按 zone 名称过滤
+        sort_by: "abs_delta"(默认) | "time_a" | "time_b"
+        top_n: 返回前 N 条，默认 50
+    """
+    return compare_frames(
+        trace_file,
+        frame_a=frame_a,
+        frame_b=frame_b,
+        zone_type=zone_type,  # type: ignore
+        filter_name=filter_name,
+        sort_by=sort_by,  # type: ignore
+        top_n=top_n,
     )
 
 
