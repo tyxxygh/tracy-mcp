@@ -467,7 +467,7 @@ static json h_zone_stats(const json& p) {
 }
 
 // Collect individual zone events in [t0,t1] ns from all source locations.
-struct EventRow { int64_t start; int64_t dur; int16_t srcloc; uint16_t thread; };
+struct EventRow { int64_t start; int64_t dur; int16_t srcloc; uint16_t thread; bool gpu; };
 
 static void collect_events(Worker& w, int64_t t0, int64_t t1, const std::string& nameFilter,
                            std::vector<EventRow>& out, size_t hardCap) {
@@ -486,7 +486,33 @@ static void collect_events(Worker& w, int64_t t0, int64_t t1, const std::string&
             const int64_t s = z->Zone()->Start();
             if (s >= t1) break;
             const int64_t end = w.GetZoneEnd(*z->Zone());
-            out.push_back({s, end - s, it.first, z->Thread()});
+            out.push_back({s, end - s, it.first, z->Thread(), false});
+            if (out.size() >= hardCap) return;
+        }
+    }
+}
+
+// GPU variant. GpuStart()/GpuEnd() are already CPU-aligned at load (each context's
+// timeDiff is applied by the worker), so they can be compared to the CPU-time window
+// directly. Zones are sorted by GpuStart(), so the window start is binary-searched.
+static void collect_gpu_events(Worker& w, int64_t t0, int64_t t1, const std::string& nameFilter,
+                               std::vector<EventRow>& out, size_t hardCap) {
+    for (auto& it : w.GetGpuSourceLocationZones()) {
+        if (!nameFilter.empty()) {
+            const char* nm = zone_name(w, it.first);
+            if (!nm || !icontains(nm, nameFilter)) continue;
+        }
+        const auto& zs = it.second.zones;
+        const auto* b = zs.begin();
+        const auto* e = zs.end();
+        const auto* lo = std::lower_bound(b, e, t0,
+            [](const auto& z, int64_t t) { return z.Zone()->GpuStart() < t; });
+        for (const auto* z = lo; z != e; ++z) {
+            const int64_t s = z->Zone()->GpuStart();
+            if (s < 0) continue;
+            if (s >= t1) break;
+            const int64_t end = w.GetZoneEnd(*z->Zone());
+            out.push_back({s, end - s, it.first, z->Thread(), true});
             if (out.size() >= hardCap) return;
         }
     }
@@ -499,6 +525,7 @@ static json h_zone_timeline(const json& p) {
     const std::string nameFilter = param_str(p, "filter_name");
     const std::string threadFilter = param_str(p, "filter_thread");
     const std::string agg = param_str(p, "aggregation", "raw");
+    const std::string zoneType = param_str(p, "zone_type", "all");
     const double intervalMs = param_num(p, "interval_ms", 16.67);
     int64_t limit = param_int(p, "limit", 500);
     if (limit > 5000) limit = 5000;
@@ -511,7 +538,10 @@ static json h_zone_timeline(const json& p) {
     const int64_t t1 = first + (int64_t)(endS * 1e9);
 
     std::vector<EventRow> evs;
-    collect_events(w, t0, t1, nameFilter, evs, 2'000'000);
+    if (zoneType == "cpu" || zoneType == "all")
+        collect_events(w, t0, t1, nameFilter, evs, 2'000'000);
+    if (zoneType == "gpu" || zoneType == "all")
+        collect_gpu_events(w, t0, t1, nameFilter, evs, 2'000'000);
 
     // thread filter (by name) after collection
     if (!threadFilter.empty()) {
@@ -566,6 +596,7 @@ static json h_zone_timeline(const json& p) {
         events.push_back({
             {"name", zone_name(w, e.srcloc)},
             {"thread", thread_name(w, e.thread)},
+            {"zone_type", e.gpu ? "gpu" : "cpu"},
             {"src_file", w.GetString(sl.file)},
             {"src_line", (int)sl.line},
             {"start_ms", ns_to_ms(e.start - first)},

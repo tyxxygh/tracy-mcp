@@ -12,6 +12,7 @@ def get_zone_timeline(
     filter_name: str | None = None,
     filter_thread: str | None = None,
     aggregation: Literal["raw", "by_frame", "by_interval"] = "raw",
+    zone_type: Literal["cpu", "gpu", "all"] = "all",
     interval_ms: float = 16.67,
     limit: int = 500,
     cursor: int | None = None,
@@ -19,7 +20,8 @@ def get_zone_timeline(
     """Zone events in [start_second, end_second] (relative to trace start).
 
     The backend binary-searches Tracy's time-sorted zones, so only the matching
-    window is materialized — no full-trace dump.
+    window is materialized — no full-trace dump. GPU zones use timestamps that are
+    already CPU-aligned at load, so they are filtered by the same CPU-time window.
     """
     result = query("zone_timeline", {
         "trace_file": trace_file,
@@ -28,6 +30,7 @@ def get_zone_timeline(
         "filter_name": filter_name or "",
         "filter_thread": filter_thread or "",
         "aggregation": aggregation,
+        "zone_type": zone_type,
         "interval_ms": interval_ms,
         "limit": limit,
         "cursor": cursor or 0,

@@ -150,6 +150,7 @@ def tool_get_zone_timeline(
     filter_name: str | None = None,
     filter_thread: str | None = None,
     aggregation: str = "raw",
+    zone_type: str = "all",
     interval_ms: float = 16.67,
     limit: int = 500,
     cursor: int | None = None,
@@ -161,6 +162,9 @@ def tool_get_zone_timeline(
     - by_frame: 按帧聚合（需要 trace 包含帧标记）
     - by_interval: 按时间间隔聚合（默认 16.67ms ≈ 60fps）
 
+    可包含 CPU 和/或 GPU zone。GPU 时间戳在加载时已对齐到 CPU 时钟，因此与
+    CPU zone 使用同一时间窗口；raw 模式下每条事件带 zone_type 字段标明来源。
+
     Args:
         trace_file: .tracy 文件路径
         start_second: 开始时间（秒），必填
@@ -168,6 +172,7 @@ def tool_get_zone_timeline(
         filter_name: 按 zone 名称过滤
         filter_thread: 按线程名过滤
         aggregation: "raw" | "by_frame" | "by_interval"
+        zone_type: "cpu" | "gpu" | "all"（默认 all，同时返回 CPU 与 GPU zone）
         interval_ms: by_interval 模式下的聚合间隔（毫秒），默认 16.67
         limit: 最大返回条数，默认 500，最大 2000
         cursor: 分页游标（仅 raw 模式）
@@ -179,6 +184,7 @@ def tool_get_zone_timeline(
         filter_name=filter_name,
         filter_thread=filter_thread,
         aggregation=aggregation,  # type: ignore
+        zone_type=zone_type,  # type: ignore
         interval_ms=interval_ms,
         limit=limit,
         cursor=cursor,
