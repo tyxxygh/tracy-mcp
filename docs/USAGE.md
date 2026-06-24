@@ -68,6 +68,16 @@ pip install -e ".[dev]"
 
 所有工具的 `start_second` / `end_second` 输入、以及返回里的 `*_ms` / `*_second`，**统一相对 trace 起点**（trace 开始 = 0）。`tool_get_frame_range` 给出的就是这个口径，可直接喂给其它时间段工具。
 
+## 5.1 首尾扰动帧裁剪（默认开启）
+
+Tracy 刚连接的前几帧、断开前的几帧，性能会被 profiling 本身扰动。**统计类工具默认排除开头 10 帧、结尾 4 帧**：
+
+- 涉及工具：`tool_get_zone_stats`、`tool_get_frame_stats`、`tool_get_zone_outliers`、`tool_compare_traces`。
+- 每次返回都带一个 `trim` 对象：`{applied, skip_first_frames, skip_last_frames, frames_used, window_seconds}` —— 让你（和模型）清楚知道排除了哪些。
+- 参数 `skip_first_frames` / `skip_last_frames` 可覆盖；设为 `0,0` 则统计整段（`zone_stats`/`compare_traces` 此时走更快的整段预计算路径）。
+- `zone_outliers` 若显式传了 `start_second`+`end_second` 窗口，则以窗口为准、忽略默认裁剪。
+- 说明：裁剪时 `zone_stats`/`compare_traces` 会在保留窗口内**逐实例重算**（大 trace 全量约 0.4s/次，载入后常驻复用）；不裁剪则用预计算，秒回。
+
 ---
 
 ## 6. 工具参考

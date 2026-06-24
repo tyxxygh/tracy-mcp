@@ -11,11 +11,17 @@ def get_zone_stats(
     filter_name: str | None = None,
     sort_by: Literal["total_time", "mean_time", "count", "max_time", "self_time"] = "total_time",
     top_n: int = 50,
+    skip_first_frames: int = 10,
+    skip_last_frames: int = 4,
 ) -> dict:
     """Per-source-location aggregates (mean/min/max/std/total/count).
 
-    Stats are precomputed in Tracy's Worker, so this is fast and exact. CPU
-    zones also include self (exclusive) time — self_total_ms/self_mean_ms/
+    By default the first 10 and last 4 frames are excluded (Tracy
+    connect/disconnect overhead perturbs them); the response's `trim` field
+    reports what was excluded. Set skip_first_frames=skip_last_frames=0 to use
+    the whole trace (and the faster precomputed path).
+
+    CPU zones also include self (exclusive) time — self_total_ms/self_mean_ms/
     self_percent — which distinguishes "slow itself" from "slow children".
     Sort by "self_time" to find true leaf hotspots.
     """
@@ -25,6 +31,8 @@ def get_zone_stats(
         "filter_name": filter_name or "",
         "sort_by": sort_by,
         "top_n": top_n,
+        "skip_first_frames": skip_first_frames,
+        "skip_last_frames": skip_last_frames,
     })
 
 
@@ -35,12 +43,17 @@ def get_zone_outliers(
     top_n: int = 10,
     start_second: float | None = None,
     end_second: float | None = None,
+    skip_first_frames: int = 10,
+    skip_last_frames: int = 4,
 ) -> dict:
     """The slowest individual invocations of a zone.
 
     Returns the worst `top_n` instances (by duration), each with its duration,
     trace-relative start, containing frame index, and thread — so a spike can
-    be pinned to a specific frame. Optionally restrict to a time window.
+    be pinned to a specific frame.
+
+    By default the first 10 / last 4 frames are excluded (warmup/cooldown).
+    Passing an explicit start_second+end_second window overrides the trim.
     """
     params: dict = {
         "trace_file": trace_file,
@@ -51,4 +64,7 @@ def get_zone_outliers(
     if start_second is not None and end_second is not None:
         params["start_second"] = start_second
         params["end_second"] = end_second
+    else:
+        params["skip_first_frames"] = skip_first_frames
+        params["skip_last_frames"] = skip_last_frames
     return query("zone_outliers", params)

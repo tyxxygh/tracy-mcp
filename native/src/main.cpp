@@ -230,6 +230,155 @@ static json agg_to_json(const ZoneAgg& a, double total_all_ns) {
     return j;
 }
 
+// A Tracy zone-child / thread-timeline vector can be stored two ways: as an
+// array of short_ptr<ZoneEvent>, OR — when is_magic() — as inline ZoneEvents
+// by value (reinterpret as Vector<ZoneEvent>). Iterate both correctly.
+template <typename F>
+static void for_each_zone(const tracy::Vector<tracy::short_ptr<tracy::ZoneEvent>>& zones, F&& f) {
+    if (zones.is_magic()) {
+        auto& vec = *(const tracy::Vector<tracy::ZoneEvent>*)&zones;
+        for (auto& v : vec) f(v);
+    } else {
+        for (auto& sp : zones) f(*sp);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Warmup/cooldown frame trimming
+//
+// The first frames after Tracy connects and the last few before it
+// disconnects are perturbed by profiling overhead. Statistics tools trim a
+// default head/tail (skip_first_frames=10, skip_last_frames=4), resolving the
+// kept frames to a time window. The trim is reported in every response so the
+// caller perceives that warmup/cooldown were excluded.
+// --------------------------------------------------------------------------
+
+struct Trim {
+    bool applied = false;
+    int64_t t0 = INT64_MIN, t1 = INT64_MAX;
+    int skip_first = 0, skip_last = 0;
+    int frames_total = 0, frames_used = 0;
+};
+
+static Trim resolve_trim(Worker& w, const json& p, int def_first = 10, int def_last = 4) {
+    Trim t;
+    t.skip_first = std::max(0, (int)param_int(p, "skip_first_frames", def_first));
+    t.skip_last = std::max(0, (int)param_int(p, "skip_last_frames", def_last));
+    const tracy::FrameData* fd = w.GetFramesBase();
+    if (fd) t.frames_total = (int)w.GetFrameCount(*fd);
+    t.frames_used = t.frames_total;
+    // No frames, nothing requested, or trim would remove everything -> full range.
+    if (!fd || (t.skip_first == 0 && t.skip_last == 0) ||
+        t.skip_first + t.skip_last >= t.frames_total) {
+        return t;
+    }
+    const int lo = t.skip_first;
+    const int hi = t.frames_total - 1 - t.skip_last;
+    t.t0 = w.GetFrameBegin(*fd, lo);
+    t.t1 = w.GetFrameEnd(*fd, hi);
+    t.frames_used = hi - lo + 1;
+    t.applied = true;
+    return t;
+}
+
+static json trim_json(Worker& w, const Trim& t) {
+    json j{
+        {"applied", t.applied},
+        {"skip_first_frames", t.skip_first},
+        {"skip_last_frames", t.skip_last},
+        {"frames_total", t.frames_total},
+        {"frames_used", t.frames_used},
+        {"note", t.applied
+             ? "stats exclude warmup/cooldown frames (Tracy connect/disconnect overhead)"
+             : "no trimming applied (set skip_first_frames/skip_last_frames)"},
+    };
+    if (t.applied) {
+        const int64_t first = w.GetFirstTime();
+        j["window_seconds"] = {ns_to_ms(t.t0 - first) / 1000.0, ns_to_ms(t.t1 - first) / 1000.0};
+    }
+    return j;
+}
+
+// Recompute CPU zone aggregates (incl. self time) from instances in [t0,t1].
+static void collect_cpu_windowed(Worker& w, const std::string& filter,
+                                 int64_t t0, int64_t t1, std::vector<ZoneAgg>& out) {
+    for (auto& it : w.GetSourceLocationZones()) {
+        const char* nm = zone_name(w, it.first);
+        if (!nm) nm = "";
+        if (!filter.empty() && !icontains(nm, filter)) continue;
+        const auto& zs = it.second.zones;
+        const auto* e = zs.end();
+        const auto* lo = std::lower_bound(zs.begin(), e, t0,
+            [](const auto& z, int64_t t) { return z.Zone()->Start() < t; });
+        int64_t total = 0, mn = INT64_MAX, mx = INT64_MIN;
+        int64_t selfT = 0, selfMn = INT64_MAX, selfMx = INT64_MIN;
+        double sumSq = 0; size_t cnt = 0;
+        for (const auto* zt = lo; zt != e; ++zt) {
+            auto* z = zt->Zone();
+            const int64_t s = z->Start();
+            if (s >= t1) break;
+            const int64_t dur = w.GetZoneEnd(*z) - s;
+            int64_t self = dur;
+            if (z->HasChildren())
+                for_each_zone(w.GetZoneChildren(z->Child()), [&](const tracy::ZoneEvent& c) {
+                    self -= (w.GetZoneEnd(c) - c.Start());
+                });
+            total += dur; mn = std::min(mn, dur); mx = std::max(mx, dur);
+            sumSq += (double)dur * (double)dur; ++cnt;
+            selfT += self; selfMn = std::min(selfMn, self); selfMx = std::max(selfMx, self);
+        }
+        if (cnt == 0) continue;
+        auto& sl = w.GetSourceLocation(it.first);
+        ZoneAgg a;
+        a.name = nm; a.file = w.GetString(sl.file); a.line = (int)sl.line; a.zone_type = "cpu";
+        a.count = cnt; a.total_ns = total; a.min_ns = mn; a.max_ns = mx;
+        a.std_ns = zone_std(sumSq, total, cnt);
+        a.has_self = true; a.self_total_ns = selfT; a.self_min_ns = selfMn; a.self_max_ns = selfMx;
+        out.push_back(std::move(a));
+    }
+}
+
+// Recompute GPU zone aggregates (no self time) from instances in [t0,t1].
+static void collect_gpu_windowed(Worker& w, const std::string& filter,
+                                 int64_t t0, int64_t t1, std::vector<ZoneAgg>& out) {
+    for (auto& it : w.GetGpuSourceLocationZones()) {
+        const char* nm = zone_name(w, it.first);
+        if (!nm) nm = "";
+        if (!filter.empty() && !icontains(nm, filter)) continue;
+        const auto& zs = it.second.zones;
+        const auto* e = zs.end();
+        const auto* lo = std::lower_bound(zs.begin(), e, t0,
+            [](const auto& z, int64_t t) { return z.Zone()->GpuStart() < t; });
+        int64_t total = 0, mn = INT64_MAX, mx = INT64_MIN;
+        double sumSq = 0; size_t cnt = 0;
+        for (const auto* zt = lo; zt != e; ++zt) {
+            auto* z = zt->Zone();
+            const int64_t s = z->GpuStart();
+            if (s < 0) continue;
+            if (s >= t1) break;
+            const int64_t dur = w.GetZoneEnd(*z) - s;
+            total += dur; mn = std::min(mn, dur); mx = std::max(mx, dur);
+            sumSq += (double)dur * (double)dur; ++cnt;
+        }
+        if (cnt == 0) continue;
+        auto& sl = w.GetSourceLocation(it.first);
+        ZoneAgg a;
+        a.name = nm; a.file = w.GetString(sl.file); a.line = (int)sl.line; a.zone_type = "gpu";
+        a.count = cnt; a.total_ns = total; a.min_ns = mn; a.max_ns = mx;
+        a.std_ns = zone_std(sumSq, total, cnt);
+        out.push_back(std::move(a));
+    }
+}
+
+static void collect_aggs_trimmed(Worker& w, const std::string& zoneType,
+                                 const std::string& filter, const Trim& trim,
+                                 std::vector<ZoneAgg>& aggs) {
+    if (zoneType == "cpu" || zoneType == "all")
+        collect_cpu_windowed(w, filter, trim.t0, trim.t1, aggs);
+    if (zoneType == "gpu" || zoneType == "all")
+        collect_gpu_windowed(w, filter, trim.t0, trim.t1, aggs);
+}
+
 // --------------------------------------------------------------------------
 // Handlers
 // --------------------------------------------------------------------------
@@ -270,11 +419,18 @@ static json h_zone_stats(const json& p) {
     if (topN > 500) topN = 500;
     Worker& w = get_worker(path);
 
+    // Default: trim warmup/cooldown frames and recompute over the kept window.
+    // skip_first=skip_last=0 uses the (faster) whole-trace precomputed stats.
+    const Trim trim = resolve_trim(w, p);
     std::vector<ZoneAgg> aggs;
-    if (zoneType == "cpu" || zoneType == "all")
-        collect_aggs(w, w.GetSourceLocationZones(), "cpu", filter, aggs);
-    if (zoneType == "gpu" || zoneType == "all")
-        collect_aggs(w, w.GetGpuSourceLocationZones(), "gpu", filter, aggs);
+    if (trim.applied) {
+        collect_aggs_trimmed(w, zoneType, filter, trim, aggs);
+    } else {
+        if (zoneType == "cpu" || zoneType == "all")
+            collect_aggs(w, w.GetSourceLocationZones(), "cpu", filter, aggs);
+        if (zoneType == "gpu" || zoneType == "all")
+            collect_aggs(w, w.GetGpuSourceLocationZones(), "gpu", filter, aggs);
+    }
 
     double totalAll = 0;
     for (auto& a : aggs) totalAll += (double)a.total_ns;
@@ -301,6 +457,7 @@ static json h_zone_stats(const json& p) {
     return json{
         {"zones", zones},
         {"total_zones_matched", (int64_t)aggs.size()},
+        {"trim", trim_json(w, trim)},
         {"summary", {
             {"total_time_ms", ns_to_ms((int64_t)totalAll)},
             {"zones_with_stats", zones.size()},
@@ -538,16 +695,23 @@ static json h_compare_traces(const json& p) {
 
     Worker& wa = get_worker(pathA);
     Worker& wb = get_worker(pathB);
+    // Each trace trims its own warmup/cooldown (same frame counts, own timing).
+    const Trim trimA = resolve_trim(wa, p);
+    const Trim trimB = resolve_trim(wb, p);
 
-    auto build = [&](Worker& w) {
+    auto build = [&](Worker& w, const Trim& trim) {
         std::vector<ZoneAgg> v;
-        if (zoneType == "cpu" || zoneType == "all") collect_aggs(w, w.GetSourceLocationZones(), "cpu", filter, v);
-        if (zoneType == "gpu" || zoneType == "all") collect_aggs(w, w.GetGpuSourceLocationZones(), "gpu", filter, v);
+        if (trim.applied) {
+            collect_aggs_trimmed(w, zoneType, filter, trim, v);
+        } else {
+            if (zoneType == "cpu" || zoneType == "all") collect_aggs(w, w.GetSourceLocationZones(), "cpu", filter, v);
+            if (zoneType == "gpu" || zoneType == "all") collect_aggs(w, w.GetGpuSourceLocationZones(), "gpu", filter, v);
+        }
         std::map<std::string, ZoneAgg> m;
         for (auto& a : v) m[a.name + "\0" + a.file + ":" + std::to_string(a.line)] = a;
         return m;
     };
-    auto ma = build(wa), mb = build(wb);
+    auto ma = build(wa, trimA), mb = build(wb, trimB);
 
     std::vector<std::string> keys;
     for (auto& kv : ma) keys.push_back(kv.first);
@@ -592,6 +756,7 @@ static json h_compare_traces(const json& p) {
     for (auto& r : rows) if (r["regression"].get<bool>()) { topReg = {{"name", r["name"]}, {"delta_percent", r["delta"]["total_percent"]}}; break; }
     return json{
         {"comparisons", cmps},
+        {"trim", {{"a", trim_json(wa, trimA)}, {"b", trim_json(wb, trimB)}}},
         {"summary", {
             {"regression_count", regressions}, {"improvement_count", improvements},
             {"total_a_time_ms", ns_to_ms((int64_t)totalA)}, {"total_b_time_ms", ns_to_ms((int64_t)totalB)},
@@ -604,19 +769,6 @@ static json h_compare_traces(const json& p) {
 // ---- compare_timelines: native call tree via GetZoneChildren --------------
 
 struct PathStat { int64_t total = 0, mn = INT64_MAX, mx = 0; std::vector<int64_t> durs; };
-
-// A Tracy zone-child / thread-timeline vector can be stored two ways: as an
-// array of short_ptr<ZoneEvent>, OR — when is_magic() — as inline ZoneEvents
-// by value (reinterpret as Vector<ZoneEvent>). Iterate both correctly.
-template <typename F>
-static void for_each_zone(const tracy::Vector<tracy::short_ptr<tracy::ZoneEvent>>& zones, F&& f) {
-    if (zones.is_magic()) {
-        auto& vec = *(const tracy::Vector<tracy::ZoneEvent>*)&zones;
-        for (auto& v : vec) f(v);
-    } else {
-        for (auto& sp : zones) f(*sp);
-    }
-}
 
 static void walk_zone(Worker& w, const tracy::ZoneEvent& z, int64_t t0, int64_t t1,
                       std::vector<std::string>& path, int depth, int maxDepth,
@@ -829,13 +981,18 @@ static json h_frame_stats(const json& p) {
     const int64_t first = w.GetFirstTime();
     const size_t n = w.GetFrameCount(fd);
 
+    // Default: exclude warmup/cooldown frames from the distribution.
+    const Trim trim = resolve_trim(w, p);
+    const size_t lo = trim.applied ? (size_t)trim.skip_first : 0;
+    const size_t hi = trim.applied ? (size_t)(n - 1 - trim.skip_last) : (n > 0 ? n - 1 : 0);
+
     struct Fr { int64_t dur; size_t idx; int64_t begin; };
     std::vector<Fr> frames;
     std::vector<int64_t> times;
     frames.reserve(n); times.reserve(n);
     const int64_t budgetNs = (int64_t)(budgetMs * 1e6);
     int64_t over = 0;
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = lo; i <= hi && i < n; i++) {
         const int64_t t = w.GetFrameTime(fd, i);
         if (t <= 0) continue;  // skip incomplete frames
         times.push_back(t);
@@ -871,6 +1028,7 @@ static json h_frame_stats(const json& p) {
         {"frame_ms", {{"mean", meanMs}, {"p50", pct(50)}, {"p95", pct(95)}, {"p99", pct(99)},
                       {"min", ns_to_ms(sorted.front())}, {"max", ns_to_ms(sorted.back())}}},
         {"slowest", slowest},
+        {"trim", trim_json(w, trim)},
     };
     if (hasBudget) {
         out["budget_ms"] = budgetMs;
@@ -893,9 +1051,19 @@ static json h_zone_outliers(const json& p) {
     Worker& w = get_worker(path);
 
     const int64_t first = w.GetFirstTime();
-    const bool hasWin = p.contains("start_second") && p.contains("end_second");
-    const int64_t t0 = first + (int64_t)(param_num(p, "start_second", 0) * 1e9);
-    const int64_t t1 = first + (int64_t)(param_num(p, "end_second", 0) * 1e9);
+    // Explicit start/end takes precedence; otherwise default warmup/cooldown trim.
+    const bool explicitWin = p.contains("start_second") && p.contains("end_second");
+    const Trim trim = explicitWin ? Trim{} : resolve_trim(w, p);
+    int64_t t0, t1;
+    bool hasWin;
+    if (explicitWin) {
+        hasWin = true;
+        t0 = first + (int64_t)(param_num(p, "start_second", 0) * 1e9);
+        t1 = first + (int64_t)(param_num(p, "end_second", 0) * 1e9);
+    } else {
+        hasWin = trim.applied;
+        t0 = trim.t0; t1 = trim.t1;
+    }
 
     struct Inst { int64_t dur, start; int16_t srcloc; uint16_t thread; };
     auto cmp = [](const Inst& a, const Inst& b) { return a.dur > b.dur; };  // min-heap on dur
@@ -953,12 +1121,14 @@ static json h_zone_outliers(const json& p) {
             {"src_line", (int)sl.line},
         });
     }
-    return json{
+    json out{
         {"zone", filter},
         {"matched_locations", matched},
         {"total_instances", total},
         {"outliers", outliers},
     };
+    if (!explicitWin) out["trim"] = trim_json(w, trim);
+    return out;
 }
 
 // --------------------------------------------------------------------------

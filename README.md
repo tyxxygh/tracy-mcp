@@ -12,6 +12,7 @@ MCP (Model Context Protocol) 服务器，让 AI 代理能够访问 [Tracy Profil
 - **树状对比**: 使用 Tracy **原生调用树**（`ZoneEvent::Child()`）逐层对比，精确而非重建
 - **帧 ↔ 时间**: 用真实帧数据精确换算（不再是 60fps 估算）
 - **消息 / 图表 / GPU**: 原生消息流、plot 时序、GPU/CPU zone
+- **首尾帧裁剪**: 统计类工具默认排除开头 10 / 结尾 4 帧（Tracy 连接/断开扰动），结果带 `trim` 说明
 
 ## 架构
 

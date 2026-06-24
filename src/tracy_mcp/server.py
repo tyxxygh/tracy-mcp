@@ -40,18 +40,25 @@ def tool_get_zone_stats(
     filter_name: str | None = None,
     sort_by: str = "total_time",
     top_n: int = 50,
+    skip_first_frames: int = 10,
+    skip_last_frames: int = 4,
 ) -> dict:
     """获取 Tracy trace 文件中 zone 的聚合统计信息。
 
     返回每个 zone（按源位置聚合）的总耗时、均值、最小值、最大值、标准差、调用次数等。
-    使用聚合模式，数据量小，速度快。
+
+    **默认排除首尾扰动帧**：跳过前 10 帧、后 4 帧（Tracy 连接/断开会扰动这些帧），
+    在剩余窗口内重新统计；返回的 `trim` 字段说明实际排除了哪些。设 skip_first_frames=
+    skip_last_frames=0 则用整段（且走更快的预计算路径）。
 
     Args:
         trace_file: .tracy 文件路径
-        zone_type: 过滤 zone 类型 — "cpu"(CPU zone), "gpu"(GPU zone), "all"(全部)
+        zone_type: 过滤 zone 类型 — "cpu", "gpu", "all"
         filter_name: 按 zone 名称过滤（支持部分匹配）
-        sort_by: 排序方式 — "total_time"(总耗时), "mean_time"(均值), "count"(调用次数), "max_time"(最大单次), "self_time"(自身独占耗时)
-        top_n: 返回前 N 条结果，默认 50，最大 500
+        sort_by: "total_time", "mean_time", "count", "max_time", "self_time"(自身独占耗时)
+        top_n: 返回前 N 条，默认 50，最大 500
+        skip_first_frames: 开头排除的帧数（默认 10）
+        skip_last_frames: 结尾排除的帧数（默认 4）
 
     CPU zone 额外含 self（独占）耗时：self_total_ms / self_mean_ms / self_percent，
     用于区分「自身慢」还是「子调用慢」。按 self_time 排序可找真正的叶子热点。
@@ -62,6 +69,8 @@ def tool_get_zone_stats(
         filter_name=filter_name,
         sort_by=sort_by,  # type: ignore
         top_n=top_n,
+        skip_first_frames=skip_first_frames,
+        skip_last_frames=skip_last_frames,
     )
 
 
@@ -70,6 +79,8 @@ def tool_get_frame_stats(
     trace_file: str,
     top_slowest: int = 10,
     budget_ms: float | None = None,
+    skip_first_frames: int = 10,
+    skip_last_frames: int = 4,
 ) -> dict:
     """获取帧时间分布与最慢的几帧。
 
@@ -77,12 +88,20 @@ def tool_get_frame_stats(
     （含帧号、相对起点的时间）。传 budget_ms 还会统计超预算帧数与占比。
     实时程序判断「有没有超帧预算、卡在哪几帧」的第一工具。
 
+    **默认排除首尾扰动帧**：跳过前 10 帧、后 4 帧（连接/断开开销，否则会污染 mean/max）；
+    返回的 `trim` 字段说明实际排除范围。设两者为 0 则统计全部帧。
+
     Args:
         trace_file: .tracy 文件路径
         top_slowest: 返回最慢的 N 帧，默认 10，最大 100
         budget_ms: 帧预算（毫秒），如 16.67（60fps）；传了则统计超预算帧
+        skip_first_frames: 开头排除的帧数（默认 10）
+        skip_last_frames: 结尾排除的帧数（默认 4）
     """
-    return get_frame_stats(trace_file, top_slowest=top_slowest, budget_ms=budget_ms)
+    return get_frame_stats(
+        trace_file, top_slowest=top_slowest, budget_ms=budget_ms,
+        skip_first_frames=skip_first_frames, skip_last_frames=skip_last_frames,
+    )
 
 
 @mcp.tool
@@ -93,18 +112,23 @@ def tool_get_zone_outliers(
     top_n: int = 10,
     start_second: float | None = None,
     end_second: float | None = None,
+    skip_first_frames: int = 10,
+    skip_last_frames: int = 4,
 ) -> dict:
     """获取某个 zone 最慢的若干次调用（离群实例）。
 
     返回耗时最长的 top_n 次实例，每条含 duration_ms、相对起点的 start_second、
     所在帧号 frame、线程 thread。用于把尖刺定位到具体某一帧（均值正常但偶发卡顿的排查）。
 
+    默认排除首尾扰动帧（前 10 / 后 4）；传了 start_second+end_second 显式窗口则以窗口为准。
+
     Args:
         trace_file: .tracy 文件路径
         filter_name: zone 名称（部分匹配，大小写不敏感），必填
         zone_type: "cpu" 或 "gpu"
         top_n: 返回最慢的 N 次，默认 10，最大 200
-        start_second / end_second: 可选，限定时间段（相对 trace 起点的秒）
+        start_second / end_second: 可选，限定时间段（相对 trace 起点的秒），覆盖默认裁剪
+        skip_first_frames / skip_last_frames: 默认裁剪帧数（10 / 4）
     """
     return get_zone_outliers(
         trace_file,
@@ -113,6 +137,8 @@ def tool_get_zone_outliers(
         top_n=top_n,
         start_second=start_second,
         end_second=end_second,
+        skip_first_frames=skip_first_frames,
+        skip_last_frames=skip_last_frames,
     )
 
 
@@ -168,11 +194,14 @@ def tool_compare_traces(
     sort_by: str = "delta_percent",
     top_n: int = 50,
     regression_threshold_pct: float = 10.0,
+    skip_first_frames: int = 10,
+    skip_last_frames: int = 4,
 ) -> dict:
     """对比两个 trace 文件的 zone 统计数据。
 
     匹配同名 zone，输出差值、回退检测。
-    两个文件同时导出（并行），耗时约等于慢的那个。
+    **默认各自排除首尾扰动帧**（前 10 / 后 4），使两边均值更可比；`trim` 字段说明排除范围。
+    设 skip_first_frames=skip_last_frames=0 则对比整段。
 
     Args:
         trace_file_a: 基准 trace 文件路径
@@ -182,6 +211,7 @@ def tool_compare_traces(
         sort_by: "delta_percent"(变化百分比), "total_time_a", "total_time_b"
         top_n: 返回前 N 条，默认 50
         regression_threshold_pct: 回退标记阈值(%)，超过此值标记为回退
+        skip_first_frames / skip_last_frames: 默认裁剪帧数（10 / 4）
     """
     return compare_traces(
         trace_file_a,
@@ -191,6 +221,8 @@ def tool_compare_traces(
         sort_by=sort_by,  # type: ignore
         top_n=top_n,
         regression_threshold_pct=regression_threshold_pct,
+        skip_first_frames=skip_first_frames,
+        skip_last_frames=skip_last_frames,
     )
 
 

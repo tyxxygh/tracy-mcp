@@ -13,8 +13,15 @@ def compare_traces(
     sort_by: Literal["delta_percent", "total_time_a", "total_time_b"] = "delta_percent",
     top_n: int = 50,
     regression_threshold_pct: float = 10.0,
+    skip_first_frames: int = 10,
+    skip_last_frames: int = 4,
 ) -> dict:
-    """Match same-named zones across two traces and report deltas/regressions."""
+    """Match same-named zones across two traces and report deltas/regressions.
+
+    Each trace excludes its own first 10 / last 4 frames by default
+    (warmup/cooldown), so the compared means are cleaner; the `trim` field
+    reports it. Set both to 0 to compare whole traces.
+    """
     return query("compare_traces", {
         "trace_file_a": trace_file_a,
         "trace_file_b": trace_file_b,
@@ -23,6 +30,8 @@ def compare_traces(
         "sort_by": sort_by,
         "top_n": top_n,
         "regression_threshold_pct": regression_threshold_pct,
+        "skip_first_frames": skip_first_frames,
+        "skip_last_frames": skip_last_frames,
     })
 
 

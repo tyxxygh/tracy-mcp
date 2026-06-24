@@ -86,6 +86,32 @@ class TestZoneOutliers:
 
 
 @pytest.mark.integration
+class TestWarmupTrim:
+    def test_frame_stats_trims_by_default(self):
+        from tracy_mcp.tools.frames import get_frame_stats
+        trimmed = get_frame_stats(_trace())
+        full = get_frame_stats(_trace(), skip_first_frames=0, skip_last_frames=0)
+        # default trim is reported and excludes frames
+        assert trimmed["trim"]["applied"] is True
+        assert trimmed["trim"]["skip_first_frames"] == 10
+        assert trimmed["trim"]["skip_last_frames"] == 4
+        assert full["trim"]["applied"] is False
+        assert trimmed["frame_count"] < full["frame_count"]
+        # excluding the warmup frames cannot make the distribution worse
+        assert trimmed["frame_ms"]["max"] <= full["frame_ms"]["max"]
+        # no negative start times once warmup frames are trimmed
+        assert all(s["start_second"] >= 0 for s in trimmed["slowest"])
+
+    def test_zone_stats_reports_trim(self):
+        from tracy_mcp.tools.stats import get_zone_stats
+        r = get_zone_stats(_trace(), zone_type="cpu", top_n=3)
+        assert r["trim"]["applied"] is True
+        full = get_zone_stats(_trace(), zone_type="cpu", top_n=3,
+                              skip_first_frames=0, skip_last_frames=0)
+        assert full["trim"]["applied"] is False
+
+
+@pytest.mark.integration
 class TestTimeline:
     def test_window_events_are_relative(self):
         from tracy_mcp.tools.timeline import get_zone_timeline
