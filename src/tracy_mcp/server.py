@@ -200,6 +200,7 @@ def tool_compare_traces(
     sort_by: str = "delta_percent",
     top_n: int = 50,
     regression_threshold_pct: float = 10.0,
+    normalize_names: bool = True,
     skip_first_frames: int = 10,
     skip_last_frames: int = 4,
 ) -> dict:
@@ -209,6 +210,12 @@ def tool_compare_traces(
     **默认各自排除首尾扰动帧**（前 10 / 后 4），使两边均值更可比；`trim` 字段说明排除范围。
     设 skip_first_frames=skip_last_frames=0 则对比整段。
 
+    **默认 normalize_names=True**：匹配前折叠 zone 名里的逐 capture 数字 id
+    （`mesh_commands_total#306` → `...#N`、`pps_from:511` → `pps_from:N`），
+    让同一逻辑 pass 在两个 capture 间能对上，即使 drawcall 数 / pass id 不同。
+    被折叠的行带 `merged_names`（折叠了几个变体）。分辨率/参数（3840x2103、
+    ShaderQuality=2）不会被折叠。设 False 走精确同名匹配。
+
     Args:
         trace_file_a: 基准 trace 文件路径
         trace_file_b: 对比 trace 文件路径
@@ -217,6 +224,7 @@ def tool_compare_traces(
         sort_by: "delta_percent"(变化百分比), "total_time_a", "total_time_b"
         top_n: 返回前 N 条，默认 50
         regression_threshold_pct: 回退标记阈值(%)，超过此值标记为回退
+        normalize_names: 折叠 #N / :N 数字后缀再匹配（默认 True）
         skip_first_frames / skip_last_frames: 默认裁剪帧数（10 / 4）
     """
     return compare_traces(
@@ -227,6 +235,7 @@ def tool_compare_traces(
         sort_by=sort_by,  # type: ignore
         top_n=top_n,
         regression_threshold_pct=regression_threshold_pct,
+        normalize_names=normalize_names,
         skip_first_frames=skip_first_frames,
         skip_last_frames=skip_last_frames,
     )

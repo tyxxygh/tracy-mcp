@@ -13,6 +13,7 @@ def compare_traces(
     sort_by: Literal["delta_percent", "total_time_a", "total_time_b"] = "delta_percent",
     top_n: int = 50,
     regression_threshold_pct: float = 10.0,
+    normalize_names: bool = True,
     skip_first_frames: int = 10,
     skip_last_frames: int = 4,
 ) -> dict:
@@ -21,6 +22,13 @@ def compare_traces(
     Each trace excludes its own first 10 / last 4 frames by default
     (warmup/cooldown), so the compared means are cleaner; the `trim` field
     reports it. Set both to 0 to compare whole traces.
+
+    `normalize_names` (default True) folds per-capture numeric ids in zone
+    names before matching — "mesh_commands_total#306" -> "...#N",
+    "pps_from:511" -> "pps_from:N" — so the same logical pass matches across
+    captures even when its drawcall count / pass id differs. Folded rows carry
+    `merged_names` (how many variants collapsed). Set False for exact-name
+    matching. Resolutions/params (3840x2103, ShaderQuality=2) are not folded.
     """
     return query("compare_traces", {
         "trace_file_a": trace_file_a,
@@ -30,6 +38,7 @@ def compare_traces(
         "sort_by": sort_by,
         "top_n": top_n,
         "regression_threshold_pct": regression_threshold_pct,
+        "normalize_names": normalize_names,
         "skip_first_frames": skip_first_frames,
         "skip_last_frames": skip_last_frames,
     })

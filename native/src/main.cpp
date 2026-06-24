@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <queue>
+#include <regex>
 #include <string>
 #include <sys/stat.h>
 #include <type_traits>
@@ -120,6 +121,16 @@ static std::string thread_name(const Worker& w, uint16_t threadIdx) {
     return n ? std::string(n) : std::to_string(tid);
 }
 
+// Fold per-capture numeric ids in zone names so the same logical pass matches
+// across traces: "mesh_commands_total#306" -> "mesh_commands_total#N",
+// "pps_from:511" -> "pps_from:N". Only "#<digits>" and ":<digits>" are folded,
+// so meaningful tokens like resolutions (3840x2103) or params (ShaderQuality=2)
+// are left intact.
+static std::string normalize_zone_name(const std::string& s) {
+    static const std::regex re("([#:])[0-9]+");
+    return std::regex_replace(s, re, "$1N");
+}
+
 // Population standard deviation (sample, n-1), matching csvexport's formula.
 static double zone_std(double sumSq, int64_t total, size_t count) {
     if (count <= 1) return 0.0;
@@ -148,6 +159,10 @@ static int64_t param_int(const json& p, const char* key, int64_t def) {
     if (p.contains(key) && p[key].is_number()) return p[key].get<int64_t>();
     return def;
 }
+static bool param_bool(const json& p, const char* key, bool def) {
+    if (p.contains(key) && p[key].is_boolean()) return p[key].get<bool>();
+    return def;
+}
 
 // --------------------------------------------------------------------------
 // Aggregated zone stats (shared by zone_stats / compare_traces)
@@ -160,6 +175,7 @@ struct ZoneAgg {
     int64_t total_ns = 0, min_ns = 0, max_ns = 0;
     size_t count = 0;
     double std_ns = 0;
+    int merged_names = 1;  // how many distinct source names folded into this one (normalize_names)
     // Self (exclusive) time — only CPU SourceLocationZones tracks it.
     bool has_self = false;
     int64_t self_total_ns = 0, self_min_ns = 0, self_max_ns = 0;
@@ -723,6 +739,7 @@ static json h_compare_traces(const json& p) {
     int64_t topN = param_int(p, "top_n", 50);
     if (topN > 500) topN = 500;
     const double regPct = param_num(p, "regression_threshold_pct", 10.0);
+    const bool normalize = param_bool(p, "normalize_names", true);
 
     Worker& wa = get_worker(pathA);
     Worker& wb = get_worker(pathB);
@@ -739,7 +756,26 @@ static json h_compare_traces(const json& p) {
             if (zoneType == "gpu" || zoneType == "all") collect_aggs(w, w.GetGpuSourceLocationZones(), "gpu", filter, v);
         }
         std::map<std::string, ZoneAgg> m;
-        for (auto& a : v) m[a.name + "\0" + a.file + ":" + std::to_string(a.line)] = a;
+        for (auto& a : v) {
+            std::string nm = normalize ? normalize_zone_name(a.name) : a.name;
+            std::string fl = normalize ? normalize_zone_name(a.file) : a.file;
+            std::string key = nm + "\0" + fl + ":" + std::to_string(a.line);
+            auto it = m.find(key);
+            if (it == m.end()) {
+                ZoneAgg na = a;
+                na.name = nm; na.file = fl;  // display the folded name
+                m[key] = std::move(na);
+            } else {
+                // Fold another per-capture-id variant of the same pass into this row.
+                auto& e = it->second;
+                e.total_ns += a.total_ns;
+                e.self_total_ns += a.self_total_ns;
+                e.count += a.count;
+                e.min_ns = std::min(e.min_ns, a.min_ns);
+                e.max_ns = std::max(e.max_ns, a.max_ns);
+                e.merged_names += 1;
+            }
+        }
         return m;
     };
     auto ma = build(wa, trimA), mb = build(wb, trimB);
@@ -765,8 +801,10 @@ static json h_compare_traces(const json& p) {
         auto side = [](const ZoneAgg* z) -> json {
             if (!z) return json{{"total_ms", 0}, {"mean_ms", 0}, {"min_ms", 0}, {"max_ms", 0}, {"count", 0}};
             double mean = z->count ? (double)z->total_ns / z->count : 0;
-            return json{{"total_ms", ns_to_ms(z->total_ns)}, {"mean_ms", ns_to_ms((int64_t)mean)},
-                        {"min_ms", ns_to_ms(z->min_ns)}, {"max_ms", ns_to_ms(z->max_ns)}, {"count", z->count}};
+            json j{{"total_ms", ns_to_ms(z->total_ns)}, {"mean_ms", ns_to_ms((int64_t)mean)},
+                   {"min_ms", ns_to_ms(z->min_ns)}, {"max_ms", ns_to_ms(z->max_ns)}, {"count", z->count}};
+            if (z->merged_names > 1) j["merged_names"] = z->merged_names;  // folded #N/:N variants
+            return j;
         };
         rows.push_back({
             {"name", ref->name}, {"src_file", ref->file}, {"src_line", ref->line},
@@ -787,6 +825,7 @@ static json h_compare_traces(const json& p) {
     for (auto& r : rows) if (r["regression"].get<bool>()) { topReg = {{"name", r["name"]}, {"delta_percent", r["delta"]["total_percent"]}}; break; }
     return json{
         {"comparisons", cmps},
+        {"normalize_names", normalize},
         {"trim", {{"a", trim_json(wa, trimA)}, {"b", trim_json(wb, trimB)}}},
         {"summary", {
             {"regression_count", regressions}, {"improvement_count", improvements},
