@@ -1,0 +1,5 @@
+build/
+.cpm_cache/
+build_configure.log
+build_compile.log
+!third_party/

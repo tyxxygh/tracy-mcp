@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.claude/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Native build artifacts are ignored by native/.gitignore
