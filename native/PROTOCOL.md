@@ -47,6 +47,7 @@ optional LRU cap bounds resident memory.
 | `frame_stats` | trace_file, top_slowest, budget_ms, skip_first_frames, skip_last_frames | frame_ms{mean,p50,p95,p99,min,max}, fps_mean, slowest[], frames_over_budget, `trim` |
 | `zone_outliers` | trace_file, filter_name, zone_type, top_n, [start_second, end_second], skip_first_frames, skip_last_frames | outliers[] = slowest instances {duration_ms, start_second, frame, thread}; `trim` |
 | `zone_jitter` | trace_file, zone_type, filter_name, sort_by(std/spike/cv/max/range), top_n, skip_first_frames, skip_last_frames | zones[] per-instance spread {mean,std,cv,min,max,p50,p95,p99,spike_ms}; `trim` — surfaces stutter sources |
+| `zone_tree` | trace_file, zone_type(default gpu), [frame] or [start_second,end_second], max_depth, limit | native call tree; each node {inclusive_ms, self_ms, self_percent, count, mean_ms, depth, children[]}; self = inclusive − Σ direct children. Only source of GPU self-time |
 
 **Warmup/cooldown trim**: stats methods (`zone_stats`, `frame_stats`, `zone_outliers`,
 `zone_jitter`, `compare_traces`) default to `skip_first_frames=10`, `skip_last_frames=4` — the first/last

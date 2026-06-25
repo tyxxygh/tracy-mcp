@@ -7,6 +7,7 @@ from fastmcp import FastMCP
 from tracy_mcp.backend.query_client import query, _find_backend, QueryBackendError
 from tracy_mcp.tools.info import get_trace_info
 from tracy_mcp.tools.stats import get_zone_stats, get_zone_jitter, get_zone_outliers
+from tracy_mcp.tools.tree import get_zone_tree
 from tracy_mcp.tools.timeline import get_zone_timeline
 from tracy_mcp.tools.compare import compare_frames, compare_traces, compare_timelines
 from tracy_mcp.tools.messages import get_messages
@@ -101,6 +102,47 @@ def tool_get_frame_stats(
     return get_frame_stats(
         trace_file, top_slowest=top_slowest, budget_ms=budget_ms,
         skip_first_frames=skip_first_frames, skip_last_frames=skip_last_frames,
+    )
+
+
+@mcp.tool
+def tool_get_zone_tree(
+    trace_file: str,
+    zone_type: str = "gpu",
+    frame: int | None = None,
+    start_second: float | None = None,
+    end_second: float | None = None,
+    max_depth: int = 6,
+    limit: int = 200,
+) -> dict:
+    """单个 trace 的原生调用树（ZoneEvent/GpuEvent 子节点），含 inclusive + self。
+
+    每个节点带 inclusive_ms、self_ms（inclusive 减去直接子节点之和）、self_percent，
+    因此能区分「自身慢」还是「子节点慢」，避免把父节点和子节点重复相加
+    （例如 OpaquePass 与它的 mesh_commands 子节点）。这也是**唯一能拿到 GPU
+    self-time 的地方**——GpuSourceLocationZones 不带 self。
+
+    窗口：传 frame 看单帧的树；或传 start_second+end_second 看时间窗；
+    都不传则用默认裁掉首尾扰动帧的窗口。GPU 时间戳已 CPU 对齐。子节点按
+    inclusive 降序；limit 限制总节点数（truncated 标记是否截断）。节点名末尾的
+    #N/:N 会解析成 name_value。
+
+    Args:
+        trace_file: .tracy 文件路径
+        zone_type: "cpu" | "gpu"（默认 gpu）
+        frame: 帧号（看单帧的树）
+        start_second / end_second: 时间窗（秒）
+        max_depth: 树最大深度，默认 6（上限 12）
+        limit: 最大节点数，默认 200
+    """
+    return get_zone_tree(
+        trace_file,
+        zone_type=zone_type,  # type: ignore
+        frame=frame,
+        start_second=start_second,
+        end_second=end_second,
+        max_depth=max_depth,
+        limit=limit,
     )
 
 

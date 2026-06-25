@@ -1333,6 +1333,117 @@ static json h_zone_outliers(const json& p) {
     return out;
 }
 
+// ---- zone_tree: single-trace native call tree with inclusive + self -------
+// Reuses path_stats / path_stats_gpu (path -> inclusive PathStat). self = a
+// node's inclusive minus the sum of its direct children's inclusive. This is the
+// only place GPU self-time is available (GpuSourceLocationZones has none), and it
+// disambiguates nesting (e.g. OpaquePass vs its mesh_commands child).
+
+static json h_zone_tree(const json& p) {
+    const std::string path = param_str(p, "trace_file");
+    const std::string zoneType = param_str(p, "zone_type", "gpu");
+    const bool gpu = (zoneType == "gpu");
+    int maxDepth = (int)param_int(p, "max_depth", 6);
+    if (maxDepth > 12) maxDepth = 12;
+    if (maxDepth < 1) maxDepth = 1;
+    int64_t limit = param_int(p, "limit", 200);
+    if (limit > 5000) limit = 5000;
+    const int64_t frame = param_int(p, "frame", -1);
+
+    Worker& w = get_worker(path);
+
+    int64_t t0, t1;
+    json windowInfo;
+    if (frame >= 0) {
+        if (w.GetFrames().empty()) throw BackendError{"bad_request", "trace has no frame data"};
+        const auto& fd = *w.GetFramesBase();
+        const int64_t cnt = (int64_t)w.GetFrameCount(fd);
+        if (frame >= cnt) throw BackendError{"bad_request", "frame out of range [0," + std::to_string(cnt - 1) + "]"};
+        t0 = w.GetFrameBegin(fd, (size_t)frame);
+        t1 = w.GetFrameEnd(fd, (size_t)frame);
+        windowInfo = {{"frame", frame}, {"window_ms", ns_to_ms(t1 - t0)}};
+    } else if (p.contains("start_second") && p.contains("end_second")) {
+        const int64_t first = w.GetFirstTime();
+        const double s0 = param_num(p, "start_second", 0), s1 = param_num(p, "end_second", 0);
+        t0 = first + (int64_t)(s0 * 1e9);
+        t1 = first + (int64_t)(s1 * 1e9);
+        windowInfo = {{"start_second", s0}, {"end_second", s1}};
+    } else {
+        const Trim trim = resolve_trim(w, p);
+        t0 = trim.t0;
+        t1 = trim.t1;
+        windowInfo = trim_json(w, trim);
+    }
+
+    auto acc = gpu ? path_stats_gpu(w, t0, t1, maxDepth) : path_stats(w, t0, t1, maxDepth);
+
+    // self = inclusive - sum(direct children inclusive)
+    std::map<std::vector<std::string>, int64_t> self;
+    for (auto& kv : acc) self[kv.first] = kv.second.total;
+    std::map<std::vector<std::string>, std::vector<std::vector<std::string>>> childrenOf;
+    std::vector<std::vector<std::string>> roots;
+    for (auto& kv : acc) {
+        const auto& pth = kv.first;
+        if (pth.size() == 1) { roots.push_back(pth); continue; }
+        auto parent = pth; parent.pop_back();
+        if (acc.count(parent)) {
+            childrenOf[parent].push_back(pth);
+            self[parent] -= kv.second.total;
+        } else {
+            roots.push_back(pth);  // parent dropped by maxDepth/window -> hoist as root
+        }
+    }
+    auto byInclusive = [&](const std::vector<std::string>& a, const std::vector<std::string>& b) {
+        return acc[a].total > acc[b].total;
+    };
+    std::sort(roots.begin(), roots.end(), byInclusive);
+
+    int64_t budget = limit;
+    bool truncated = false;
+    std::function<json(const std::vector<std::string>&)> emit = [&](const std::vector<std::string>& pth) -> json {
+        const auto& ps = acc[pth];
+        const size_t n = ps.durs.size();
+        json node{
+            {"name", pth.back()}, {"zone_type", gpu ? "gpu" : "cpu"},
+            {"inclusive_ms", ns_to_ms(ps.total)}, {"self_ms", ns_to_ms(self[pth])},
+            {"self_percent", ps.total > 0 ? (double)self[pth] / (double)ps.total * 100.0 : 0.0},
+            {"count", n}, {"mean_ms", ns_to_ms(n ? ps.total / (int64_t)n : 0)},
+            {"depth", (int)pth.size()},
+        };
+        add_name_value(node, pth.back());
+        auto cit = childrenOf.find(pth);
+        if (cit != childrenOf.end() && budget > 0) {
+            auto kids = cit->second;
+            std::sort(kids.begin(), kids.end(), byInclusive);
+            json arr = json::array();
+            for (auto& c : kids) {
+                if (budget-- <= 0) { truncated = true; break; }
+                arr.push_back(emit(c));
+            }
+            if (!arr.empty()) node["children"] = std::move(arr);
+        } else if (cit != childrenOf.end()) {
+            truncated = true;
+        }
+        return node;
+    };
+
+    json tree = json::array();
+    for (auto& r : roots) {
+        if (budget-- <= 0) { truncated = true; break; }
+        tree.push_back(emit(r));
+    }
+
+    json out{
+        {"tree", tree},
+        {"zone_type", gpu ? "gpu" : "cpu"},
+        {"max_depth", maxDepth},
+        {"node_count", (int64_t)acc.size()},
+        {"truncated", truncated},
+        {"window", windowInfo},
+    };
+    return out;
+}
+
 // ---- zone_jitter: per-zone frame-to-frame variance / spikes ---------------
 // Surfaces stutter sources: zones whose per-instance time is unstable (high std
 // / spikes), which an averaged stat hides. GPU timestamps are CPU-aligned, so
@@ -1462,6 +1573,7 @@ static json dispatch(const std::string& method, const json& params) {
     if (method == "plots") return h_plots(params);
     if (method == "compare_traces") return h_compare_traces(params);
     if (method == "compare_frames") return h_compare_frames(params);
+    if (method == "zone_tree") return h_zone_tree(params);
     if (method == "zone_jitter") return h_zone_jitter(params);
     if (method == "compare_timelines") return h_compare_timelines(params);
     throw BackendError{"unknown_method", "unknown method: " + method};
