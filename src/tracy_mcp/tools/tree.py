@@ -11,6 +11,7 @@ def get_zone_tree(
     frame: int | None = None,
     start_second: float | None = None,
     end_second: float | None = None,
+    filter_name: str | None = None,
     max_depth: int = 6,
     limit: int = 200,
 ) -> dict:
@@ -27,10 +28,17 @@ def get_zone_tree(
     GPU timestamps are already CPU-aligned. Children are sorted by inclusive
     time; `limit` caps the total node count (`truncated` flags when hit).
     Trailing #N/:N in a node name is surfaced as `name_value`.
+
+    `filter_name` re-roots the tree at the outermost nodes whose name matches
+    (substring), so you can pull just a subtree out of the full frame — e.g.
+    filter_name="ShadowDepthMap" returns only the shadow subtree. `max_depth`
+    is still measured from the real root, so raise it to see deep into a nested
+    subtree.
     """
     params: dict = {
         "trace_file": trace_file,
         "zone_type": zone_type,
+        "filter_name": filter_name or "",
         "max_depth": max_depth,
         "limit": limit,
     }

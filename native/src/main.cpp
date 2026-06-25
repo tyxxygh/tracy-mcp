@@ -1343,6 +1343,7 @@ static json h_zone_tree(const json& p) {
     const std::string path = param_str(p, "trace_file");
     const std::string zoneType = param_str(p, "zone_type", "gpu");
     const bool gpu = (zoneType == "gpu");
+    const std::string filter = param_str(p, "filter_name");
     int maxDepth = (int)param_int(p, "max_depth", 6);
     if (maxDepth > 12) maxDepth = 12;
     if (maxDepth < 1) maxDepth = 1;
@@ -1396,6 +1397,21 @@ static json h_zone_tree(const json& p) {
     auto byInclusive = [&](const std::vector<std::string>& a, const std::vector<std::string>& b) {
         return acc[a].total > acc[b].total;
     };
+
+    // filter_name: re-root the tree at the outermost nodes whose name matches, so
+    // you can pull just a subtree (e.g. "ShadowDepthMap") out of the full frame.
+    if (!filter.empty()) {
+        std::vector<std::vector<std::string>> matched;
+        for (auto& kv : acc) {
+            const auto& pth = kv.first;
+            if (!icontains(pth.back().c_str(), filter)) continue;
+            bool ancestorMatch = false;
+            for (size_t k = 0; k + 1 < pth.size(); ++k)
+                if (icontains(pth[k].c_str(), filter)) { ancestorMatch = true; break; }
+            if (!ancestorMatch) matched.push_back(pth);  // outermost match only
+        }
+        roots.swap(matched);
+    }
     std::sort(roots.begin(), roots.end(), byInclusive);
 
     int64_t budget = limit;

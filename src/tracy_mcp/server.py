@@ -112,6 +112,7 @@ def tool_get_zone_tree(
     frame: int | None = None,
     start_second: float | None = None,
     end_second: float | None = None,
+    filter_name: str | None = None,
     max_depth: int = 6,
     limit: int = 200,
 ) -> dict:
@@ -127,11 +128,16 @@ def tool_get_zone_tree(
     inclusive 降序；limit 限制总节点数（truncated 标记是否截断）。节点名末尾的
     #N/:N 会解析成 name_value。
 
+    filter_name：把树**重新挂根**到名字匹配（子串）的最外层节点，从而只看某个
+    子树——例如 filter_name="ShadowDepthMap" 只返回阴影子树。max_depth 仍从真正
+    的根算起，看深层子树时把它调大。
+
     Args:
         trace_file: .tracy 文件路径
         zone_type: "cpu" | "gpu"（默认 gpu）
         frame: 帧号（看单帧的树）
         start_second / end_second: 时间窗（秒）
+        filter_name: 只看名字匹配的子树（子串匹配）
         max_depth: 树最大深度，默认 6（上限 12）
         limit: 最大节点数，默认 200
     """
@@ -141,6 +147,7 @@ def tool_get_zone_tree(
         frame=frame,
         start_second=start_second,
         end_second=end_second,
+        filter_name=filter_name,
         max_depth=max_depth,
         limit=limit,
     )
